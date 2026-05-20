@@ -22,6 +22,7 @@
 #include <seqan3/search/dream_index/interleaved_bloom_filter.hpp>
 #include <seqan3/search/views/minimiser_hash.hpp>
 #include <seqan3/utility/views/chunk.hpp>
+#include <seqan3/alphabet/views/char_to.hpp> // para la conversion 
 
 #include <cinttypes>
 #include <cmath>
@@ -33,22 +34,28 @@
 #include <type_traits>
 #include <vector>
 
-//añadir MPI 
+#include<filesystem> //necesario para calcular el tamano del archivo
+
 #include <mpi.h>
 
+// librerias para el mapeo del archivo a maemoria ram 
+#include <sys/mman.h> // para mmap 
+#include <sys/stat.h> // para struct stat y fstat
+#include <fcntl.h> // para open 
+#include <unistd.h> // para close 
+#include <string_view> // para optimizar la conversion sin copias
+		       //#include <cereal/types/utility.hpp> // para serializar std::pair con cereal
 
-// --- PARCHE PARA SERIALIZAR PAIRS (std::pair) ---
+
+
+		       //para la serializacion con cereal de std::pair
 namespace cereal {
-	template<class Archive, class F, class S>
+	template<class Archive, class F, class S> 
 		void serialize(Archive & archive, std::pair<F, S> & p)
 		{
-			archive(p.first, p.second);
+			archive(p.first, p.second); 
 		}
 }
-
-
-
-
 
 namespace GanonClassify
 {
@@ -113,93 +120,6 @@ namespace GanonClassify
 			std::vector< std::vector< seqan3::dna4 > > seqs2{};
 		};
 
-		//funcion auxiliar para empaquetar el ReadBatches
-
-		void pack_readbatch( const ReadBatches& rb, char* buffer, int bufferSize, int& position, MPI_Comm comm)
-		{
-			int paired = rb.paired ? 1 : 0; //paired es un bool y lo vamos a enviar como un int
-			int number_reads = rb.ids.size();
-
-			MPI_Pack( &paired, 1, MPI_INT, buffer, bufferSize, &position, comm ); //empaquetar el valor de paired 
-			MPI_Pack( &number_reads, 1, MPI_INT, buffer, bufferSize, &position, comm ); //empaquetar el numero de lecturas
-												    //empaquetar los ids de las lecturas que son strings 
-			for (const std::string& id : rb.ids)
-			{
-				int idlen = id.size();
-				MPI_Pack( &idlen, 1, MPI_INT, buffer, bufferSize, &position, comm ); //empaquetar la longitud del id
-				MPI_Pack( id.c_str(), idlen, MPI_CHAR, buffer, bufferSize, &position, comm ); //empaquetar el id, c_str() devuelve un puntero un const char * con el contenido del 
-													      //string pero terminado en '\0' y MPI_Pack lo empaqueta como un array de caracteres
-													      //std:string no es reconocido por MPI directamente y para empaquetarlo necesito un 
-													      //const char * con el contenido del string, el idlen no enviara el \0 para ello 
-													      //tendria que ser idlen +1 ya que size no cuenta el \0
-
-			}
-			//Espaquetar las secuencias de los nucleotidos 
-			for (const auto& seq : rb.seqs)
-			{
-				int seqlen = seq.size();
-				MPI_Pack( &seqlen, 1, MPI_INT, buffer, bufferSize, &position, comm ); //empaquetar la longitud de la secuencia
-				MPI_Pack( seq.data(), seqlen, MPI_CHAR, buffer, bufferSize, &position, comm ); //empaquetar la secuencia de nucleotidos
-			}
-
-			//empaquetar las secuencias de los nucleotidos del segundo par si existe (modo paired)
-			if(paired){
-				for (const auto& seq2 : rb.seqs2){
-					int seqlen2 = seq2.size();
-					MPI_Pack( &seqlen2, 1, MPI_INT, buffer, bufferSize, &position, comm ); //empaquetar la longitud de la secuencia del segundo para
-					MPI_Pack( seq2.data(), seqlen2, MPI_CHAR, buffer, bufferSize, &position, comm ); //empaquetar la secuencia del segundo par
-				}
-			}
-		}
-
-		//funcion auxiliar para desempaquetar el ReadBatches 
-
-		void unpack_readbatch(ReadBatches& rb, const char* buffer, int bufferSize, int& position, MPI_Comm comm)
-		{
-			int paired = 0;
-			int number_reads = 0;
-
-			MPI_Unpack(buffer, bufferSize, &position, &paired, 1, MPI_INT, comm ); //desempaquetar el valor de paired 
-			MPI_Unpack(buffer, bufferSize, &position, &number_reads, 1, MPI_INT, comm ); //desempaquetar el numero de lecturas
-												     //
-			rb.paired = (paired == 1); //convierto el int de nuevo a bool true o false (1 o 0)
-			rb.ids.resize(number_reads); //redimensionar el vector de ids al numero de lecturas 
-			rb.seqs.resize(number_reads); //redimensionar el vector de secuencias al numero de lecturas 
-			if(rb.paired)
-				rb.seqs2.resize(number_reads); //redimensionar el vector de secuencias del segundo par al numero de lecturas 
-
-			//toca desempaquetar los ids 
-			for (int i = 0; i < number_reads; ++i){
-				int idlen = 0;
-				MPI_Unpack(buffer, bufferSize, &position, &idlen, 1, MPI_INT, comm ); //desempaquetar la longitud del id 
-				std::vector<char> temp_id(idlen); //vector temporal para almacenar el id
-				MPI_Unpack(buffer, bufferSize, &position, temp_id.data(), idlen, MPI_CHAR, comm ); //desempaquetar el id 
-				rb.ids[i] = std::string(temp_id.data(), idlen); //convertir el vector de char a string y asignarlo al vector de ids 
-			}
-
-			//toca desempaquetar las secuencias de nucleotidos (seqs)
-			for (int i = 0; i < number_reads; ++i){
-				int seqlen = 0;
-				MPI_Unpack(buffer, bufferSize, &position, &seqlen, 1, MPI_INT, comm ); //desempaquetar la longitud de la secuencia 
-				std::vector<seqan3::dna4> temp_seq(seqlen); //vector temporal para almacenar la secuencia 
-				MPI_Unpack(buffer, bufferSize, &position, temp_seq.data(), seqlen, MPI_CHAR, comm ); //desempaquetar la secuencia 
-				rb.seqs[i] = std::move(temp_seq); //mover la secuencia al vector de secuencias
-			}
-
-			//toca desempaquetar las secuencias del segundo par (seqs2) si existe (modo paired) 
-			if(rb.paired){
-				for (int i = 0; i < number_reads; ++i){
-					int seqlen2 = 0;
-					MPI_Unpack(buffer, bufferSize, &position, &seqlen2, 1, MPI_INT, comm ); //desempaquetar la longitud de la secuencia del segundo par
-					std::vector<seqan3::dna4> temp_seq2(seqlen2); //vector temporal para almacenar la secuencia del segundo par
-					MPI_Unpack(buffer, bufferSize, &position, temp_seq2.data(), seqlen2, MPI_CHAR, comm ); //desempaquetar la secuencia del segundo par
-					rb.seqs2[i] = std::move(temp_seq2); //mover la secuencia del segundo par al vector de secuencias del segundo par
-				}
-			}
-		}
-
-
-
 		struct ReadMatch
 		{
 			ReadMatch()
@@ -237,15 +157,14 @@ namespace GanonClassify
 			size_t matches      = 0;
 			size_t lca_reads    = 0;
 			size_t unique_reads = 0;
-
-			// funcion serialize para decirle a Cereal como tiene que guardar el struct
+			//para que cereal pueda serializar el struct
 			template <class Archive>
 				void serialize( Archive& ar ){
 					ar (matches, lca_reads, unique_reads);
 				}
 		};
 
-		typedef robin_hood::unordered_map< std::string, detail::Rep >  TRep;
+		typedef robin_hood::unordered_map< std::string, Rep >  TRep;
 		typedef robin_hood::unordered_map< std::string, Node > TTax;
 
 		struct Total
@@ -332,6 +251,665 @@ namespace GanonClassify
 				FilterConfig filter_config;
 			};
 
+
+		//funcion auxiliar para comprobar si estamos en una cabecera valida o es info de calidad,
+		// miramos si la linea empieza por @ y si la tercera linea empieza por +.
+		// Mas info de como es el formato FASTQ en https://es.wikipedia.org/wiki/Formato_FASTQ
+
+		bool is_valid_fastq_start( std::ifstream& file ) {
+			std::streampos pos_actual = file.tellg(); //guarda la pos actual del puntero de lectura 
+			std::string l1, l2, l3; // 3 lineas del bloque fastq 
+
+			if ( !std::getline(file, l1) ){
+				file.clear(); //limpiar flags de error antes de volver
+				return false; 
+			}
+			if (l1.empty() || l1[0] != '@'){
+				file.clear();
+				file.seekg(pos_actual); //volvemos a la pos actual y q no es comienzo
+				return false;
+			}
+
+			//leer las dos lineas mas para ver q es un + y comprobar q de verdad es el inicio 
+			if ( !std::getline(file, l2) ){
+				file.clear();
+				file.seekg(pos_actual); //volvemos a la pos actual y q no es comienzo
+				return false;
+			}
+			if ( !std::getline(file, l3) ){
+				file.clear();
+				file.seekg(pos_actual); //volvemos a la pos actual y q no es comienzo
+				return false;
+			}
+
+			bool valid = (!l3.empty() && l3[0] == '+'); //la tercera linea debe empezar por + para ser un bloque fastq valido
+			file.clear();
+			file.seekg(pos_actual); //volvemos a la pos actual para q el proceso de lectura normal pueda leer el bloque completo
+			return valid;
+		}
+
+		// parser paralelo de las lecturas, cada rank abrira se encargara de una parte del archivo, para ello claro, el archvivo debe estar descomprimido
+
+		//para leer su trozo cada rank hago uso de seekg que me permite mover el puntero de lectura a la posicion que yo quiera.
+
+
+		// funcion auxiliar pa buscar saltos de linea de una manera rapida en memoria ram (inline, pa decirle al compilador q en vez de la funcion meta su codigo en la llamada)
+		inline char* find_next_newline( char* cursor, char* end ){
+			return (char*) memchr( cursor, '\n', end - cursor ); //memchr busca el siguiente carater '\n' en el bloque de memoria entre cursor y end, me devuelve un puntero a ese caracter o nullptr si no lo encuentra
+		}
+
+
+
+		void parse_reads_parallel( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config, uint64_t start1, uint64_t end1, uint64_t start2, uint64_t end2, int rank, bool interleaved, bool two_files ){
+
+			try{
+				long long lecturas_procesadas = 0;
+				size_t batch_size = config.n_reads; // numero de lecturas por batch 
+				//buffer aumentadno a 8MB pa no staturar mucho al so con llamadas constantes 
+				size_t BUFFER_SIZE = 8 * 1024 * 1024; // 8MB
+				if (two_files){
+					//dos archivos paired reads separados 
+					std::string filename1 = config.paired_reads[0]; //nombre del archivo 1 
+					std::string filename2 = config.paired_reads[1]; //nombre del archivo 2 
+
+
+					std::ifstream file1, file2; //streams de lectura para el archivo 1 y 2
+
+					std::vector< char> buffer1(BUFFER_SIZE), buffer2(BUFFER_SIZE); //buffers para leer los archivos, esto es para no saturar al sistema con llamadas constantes a disco, leemos bloques grandes de una vez y luego los procesamos en memoria ram 
+					file1.rdbuf()->pubsetbuf(buffer1.data(), BUFFER_SIZE); //asignamos el buffer al stream de lectura del archivo 1
+					file2.rdbuf()->pubsetbuf(buffer2.data(), BUFFER_SIZE); //asignamos el buffer al stream de lectura del archivo 2 
+					
+					file1.open(filename1, std::ios::binary); //abrimos el archivo 1 como binario 
+					file2.open(filename2, std::ios::binary); //abrimos el archivo 2 como binario  
+
+					if( !file1.is_open() || !file2.is_open() ){
+						std::cerr << "[RANK " << rank << "] Error opening files: " << filename1 << " or " << filename2 << std::endl; //mensaje de error si no de pude abirir alguno de los archivos 
+						return;
+					}
+
+
+					file1.seekg(start1); //movemos el puntero de lectura del archivo 1 a la posicion de inicio que nos toca 
+
+					file2.seekg(start2); //movemos el puntero de lectura del archivo 2 a la posicion de inicio que nos toca
+
+					// ahora toca sincronizar ambos archivos 
+					if ( start1 > 0 ){
+						std::string saltada; std::getline(file1, saltada); // saltar primera linea del archivvo que estara cortada 
+						while (file1.good() && file1.peek() != EOF){
+							if (is_valid_fastq_start(file1)){
+								//si es un bloque fastq valido, pues ya estamos sincronizados 
+								break;
+							}else{
+								//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
+								std::getline(file1, saltada); // seguir saltando lineas
+							}
+
+						}
+					}
+
+					if ( start2 > 0 ){
+						std::string saltada; std::getline(file2, saltada); // saltar primera linea del archivvo que estara cortada 
+						while (file2.good() && file2.peek() != EOF){
+							if (is_valid_fastq_start(file2)){
+								//si es un bloque fastq valido, pues ya estamos sincronizados 
+								break;
+							}else{
+								//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
+								std::getline(file2, saltada); // seguir saltando lineas
+							}
+						}
+					}
+
+					std::vector<std::string> ids; ids.reserve(batch_size); //vector para almacenar los IDs de las lecturas 
+					std::vector<std::vector<seqan3::dna4>> seqs; seqs.reserve(batch_size); //vector pa almacenar las secuencuas 
+					std::vector<std::vector<seqan3::dna4>> seqs2; seqs2.reserve(batch_size); //vector pa almacenar las secuecias de la pareja
+
+					std::string l1_id, l1_seq, l1_plus, l1_qual, l2_id, l2_seq, l2_plus, l2_qual; //variables para almacenar las lineas de cada bloque fastq de ambos archivos ( el id la secuencia el + y la calidad)
+					//reservar memoria para las lineas 
+					l1_id.reserve(300); l1_seq.reserve(600); l1_plus.reserve(100); l1_qual.reserve(600); //reservar 300 caraceres para el ID, 600 para la secuencia etc asi no tenemos que ir recolocando la mem constantemente y se mejora el rendimiento 
+					l2_id.reserve(300); l2_seq.reserve(600); l2_plus.reserve(100); l2_qual.reserve(600); //reservar memoria para las lineas del segundo archivo 
+
+					while ( file1.good() && file2.good() ){
+						//good devuelve true si el stream esta en un estado bueno para seguir leyendo, es decir, no ha llegado al final del archivo ni ha ocurrido un Error
+						if (file1.tellg() != -1 && file1.tellg() >= end1 || file2.tellg() != -1 && file2.tellg() >= end2){
+							//si hemos llegado al final de nuestro bloque asignado en alguno de los archivos, pues salimos del bucle de lectura (como es paired si llegamos al final de 1 es q esta mal el otro asi q )
+							break;
+						}
+						if (!std::getline(file1, l1_id) || !std::getline(file1, l1_seq) || !std::getline(file1, l1_plus) || !std::getline(file1, l1_qual)) break;
+						if (!std::getline(file2, l2_id) || !std::getline(file2, l2_seq) || !std::getline(file2, l2_plus) || !std::getline(file2, l2_qual)) break;
+
+						if (!l1_id.empty() && l1_id[0] == '@') l1_id.erase(0, 1); // eliminar el @ del ID 
+						if (!l2_id.empty() && l2_id[0] == '@') l2_id.erase(0, 1);
+
+						ids.push_back(std::move(l1_id)); //almacenar el id 
+
+						auto v1 = l1_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+						seqs.emplace_back(v1.begin(), v1.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
+						auto v2 = l2_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+						seqs2.emplace_back(v2.begin(), v2.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
+						l1_id.clear(); l1_seq.clear(); l1_plus.clear(); l1_qual.clear(); //limpiar las lineas para la siguiente lectura, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
+						l2_id.clear(); l2_seq.clear(); l2_plus.clear(); l2_qual.clear(); //limpiar las lineas del segundo archivo para la siguiente lectura 
+						lecturas_procesadas++;
+
+						if( ids.size() >= batch_size ){
+							//si hemos alcanzado el tamano de batch, enviamos el batch a la cola para que el hilo de procesamiento lo procese, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
+							stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
+							queue1.push( ReadBatches{ true, std::move(ids), std::move(seqs), std::move(seqs2) } ); //enviar el batch a la cola, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
+							ids.clear(); seqs.clear(); seqs2.clear(); //limpiar los vectores para el siguiente lote, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
+							ids.reserve(batch_size); seqs.reserve(batch_size); seqs2.reserve(batch_size);
+						}
+
+					}
+
+
+					// enviar el ultimo batch con las lecturas restantes que quedaran aunque no alcanzara el tamano del batch
+					if (!ids.empty()) { stats.input_reads += ids.size(); queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2))); }
+					queue1.notify_push_over();
+
+				}else{
+					//single reads o interleaved 
+					std::string filename = config.single_reads.empty() ? config.paired_reads[0] : config.single_reads[0]; //nombre del archivo 
+					std::ifstream file;
+					std::vector<char> buffer(BUFFER_SIZE);
+					file.rdbuf()->pubsetbuf(buffer.data(), BUFFER_SIZE);
+																				
+					file.open(filename, std::ios::binary);
+					if (!file.is_open()) return;
+
+					file.seekg(start1); //movemos el puntero de lectura del archivo a la posicion de inicio que nos toca
+
+					if (start1 > 0){
+						std::string saltada; std::getline(file, saltada); // saltar primera linea del archivvo que estara cortada 
+						while (file.good() && file.peek() != EOF){
+							if (is_valid_fastq_start(file)){
+								//si es un bloque fastq valido, pues ya estamos sincronizados  pero dependera si es interleaved o no 
+								if (interleaved){
+									//si es interleaved, si caemos en el read 2 hay q avanzar hasta el primero
+									std::streampos pos = file.tellg(); //guarda la pos actual del puntero de lectura
+									std::string test_id; std::getline(file, test_id); //leer el id de la lectura 
+									if (test_id.find("/2") != std::string::npos || test_id.find(" 2:") != std::string::npos ){
+										std::getline(file, saltada); std::getline(file, saltada); std::getline(file, saltada); //avanzar hasta el primer read de la pareja 
+										continue; //std::string::npos es el valor que devuelve find cuanto no enuentra la subcadena
+									}else{
+										file.seekg(pos); //si no es una lectura 2 volvemos a la pos anterior 
+									}
+								}
+								break;
+							}
+							//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
+							std::getline(file, saltada); // seguir saltando lineas
+						}
+					}
+					
+					std::vector<std::string> ids; ids.reserve(batch_size);
+					std::vector<std::vector<seqan3::dna4>> seqs; seqs.reserve(batch_size);
+					std::vector<std::vector<seqan3::dna4>> seqs2;
+					if (interleaved) seqs2.reserve(batch_size);
+					std::string l_id, l_seq, l_plus, l_qual;
+
+					l_id.reserve(300); l_seq.reserve(600); l_plus.reserve(100); l_qual.reserve(600);
+					
+					while (file.good()){
+						if (file.tellg() != -1 && file.tellg() >= end1){
+							//si hemos llegado al final de nuestro bloque asignado, pues salimos del bucle de lectura 
+							break;
+						}
+						if (!std::getline(file, l_id) || !std::getline(file, l_seq) || !std::getline(file, l_plus) || !std::getline(file, l_qual)) break;
+
+						if (!l_id.empty() && l_id[0] == '@') l_id.erase(0, 1); // eliminar el @ del ID 
+
+						ids.push_back(std::move(l_id)); //almacenar el id 
+
+						auto v = l_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+						seqs.emplace_back(v.begin(), v.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
+
+						if (interleaved){
+							if (!std::getline(file, l_id) || !std::getline(file, l_seq) || !std::getline(file, l_plus) || !std::getline(file, l_qual)) break;
+							auto v2 = l_seq | seqan3::views::char_to<seqan3::dna4>;
+							seqs2.emplace_back(v2.begin(), v2.end());
+						}
+
+						l_id.clear(); l_seq.clear(); l_plus.clear(); l_qual.clear(); //limpiar las lineas para la siguiente lectura, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
+						lecturas_procesadas++;
+
+						if( ids.size() >= batch_size ){
+							//si hemos alcanzado el tamano de batch, enviamos el batch a la cola para que el hilo de procesamiento lo procese, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
+							stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
+						
+							if (interleaved) queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2)));
+							else queue1.push(ReadBatches(false, std::move(ids), std::move(seqs)));
+
+							ids.clear(); seqs.clear(); ids.reserve(batch_size); seqs.reserve(batch_size); if (interleaved) seqs2.clear(); seqs2.reserve(batch_size); //limpiar los vectores para el siguiente lote, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
+						}
+					}
+
+					// enviar el ultimo batch con las lecturas restantes que quedaran aunque no alcanzara el tamano del batch_size 
+					if (!ids.empty()) { 
+						stats.input_reads += ids.size(); 
+						if (interleaved) queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2)));
+						else queue1.push(ReadBatches(false, std::move(ids), std::move(seqs)));
+					}
+					queue1.notify_push_over();
+
+				}
+
+			} catch( const std::exception& e ){
+				std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: " << e.what() << "\n" << std::endl;
+				queue1.notify_push_over(); // Evitar deadlock
+			} catch(...){
+				std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: Excepcion desconocida.\n" << std::endl;
+				queue1.notify_push_over(); // Evitar deadlock
+			}
+
+
+		}
+
+
+
+		/*
+		   void parse_reads_parallel( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config, uint64_t start, uint64_t end, int rank, bool interleaved){
+		// funcion commo la otra parse reads pero si se le pasa un archivo con paired reads (interleaved a true) lo lee como paired_reads y si no como single reads. 
+		// por que un archivo con las lecturas entremezcladas y no dos archivos con ellas separadas -> pues por q si le meto dos archivos y estoy usando bytes para inciios y finales aproximados , como la calidad de cada secuencia puede ser distinto, seria un rollo y con mal rendimiento ir sincronizando ambos archivos tratando de encontrar las secuencias que deberia ir juntas, es mas facil antes de ejecutar el programa pasarle un programa estilo seqtk y que las entremezcle una vez a uno con ambas lecturas juntas y listo. 
+
+		try{
+
+		if (config.single_reads.empty()){
+		return; // si no hay reads pa fuera, lo pongo single por q antes de llamar a la funcion lo metere en single reads y ponde el interleaved a true o falsse
+		}
+
+		std::string filename = config.single_reads[0]; //nombre del archivo 
+
+		//abrir el archivo y mapearlo 
+		int fd = open(filename.c_str(), O_RDONLY); //abro el archivo en modo lectura, me da un descriptor de fichero,  .c_str() es necesario para convertir el string a un puntero a char que es lo q espera open
+
+		if (fd == -1){
+		std::cerr << "[RANK " << rank << "] Error opening file, open() fail: " << filename << std::endl; //mensaje de error si no de pude abirir el archivo 
+		return;
+		}
+
+		struct stat st; //struct para almacenar la info del archivo 
+		if (fstat ( fd, &st ) == -1){
+		std::cerr << "[RANK " << rank << "] Error getting file size with fstat(): " << filename << std::endl; //mensaje de error si no de pude obtener el tamano del archivo 
+		close(fd); //cerrar el descriptor de fichero antes de salir
+		return;
+		}
+
+		uint64_t file_size = st.st_size; //tamanao del archivo en bytes
+		long page_size = sysconf(_SC_PAGESIZE); //obtenemos el tamano de pagina del sistema con sysconf, esto es necesario para calcular la posicion de inicio alineada a pagina
+		uint64_t map_offset = (start / page_size) * page_size; // calcular la posicion de incio de mapeao alineada, redondear hacia abajo claro, tiene q ser multiplo del tamano de pagina del sistema 
+		uint64_t local_skip = start - map_offset; //calcular cuanto hay q saltar desde el inicio pa leer la parte que nos toca, saltar desde el inicio de la parte mapeada
+		size_t margin = 64 * 1024; // 64kB de margen de seguridad para no leer fuera del archivo, si terminamos en medio de una secuencia poder acabar de leerla aunque nos saltemos de la parte q nos tocaba para no dejarla a medio leer
+		size_t map_length = (end - map_offset) + margin; //calcular el tamano a mapear del archivo a memoria ram 
+		if ( map_offset + map_length > file_size ){
+		map_length = file_size - map_offset; //ajustar el tamano a mapear para no leer fuera del archivo 
+		}
+
+		char* map_ptr = static_cast<char*>( mmap( nullptr, map_length, PROT_READ, MAP_PRIVATE, fd, map_offset ) ); //mmap devuelve un puntero a la memoria mapeada, el primer parametro es nullptr para que el sistema elija la direccion de memoria, el segundo es el tamano a mapear, el tercero son las protecciones (lectura), el cuarto son las banderas (MAP_PRIVATE para que los cambios no se reflejen en el archivo), el quinto es el descriptor de fichero y el sexto es el offset del archivo a mapear 
+		if ( map_ptr == MAP_FAILED ){
+		std::cerr << "[RANK " << rank << "] Error mapping file to memory with mmap(): " << filename << std::endl; //mensaje de error si no de pude mapear el archivo a memoria ram 
+		close(fd); //cerrar el descriptor de fichero antes de salir
+		return;
+		}
+
+		madvise( map_ptr, map_length, MADV_SEQUENTIAL | MADV_WILLNEED ); //decirle al kernel que vamos a leer el archivo de manera secuencial y que se prepare para eso, esto puede mejorar el rendimiento al evitar lecturas innecesarias y optimizar el uso de la cache del sistema operativo 
+
+
+		char* cursor = map_ptr + local_skip; //cursor va a estar donde comenzamos a leer q es el comienzo de la memoria mapeada mas lo q hay q saltarse
+		char* end_ptr = map_ptr + map_length; //donde terminamos de leer incluyendo el margen
+		size_t logical_size = end - map_offset; // tamano logico de la parque q nos toca leer 
+		char* logical_end = map_ptr + std::min(logical_size, map_length); //puntero al final logico de nuestra parte, para evitar problemas de apuntar fuera del archivo si end - map_offset es mayor que map_length 
+										  //char* logical_end = map_ptr + (end - map_offset);
+
+										  //mirar el archivo 
+
+										  if (start > 0){
+		//saltar primera linea q estara cortada 
+		char* newline = find_next_newline( cursor, end_ptr );
+		if ( newline ) cursor = newline +1; //avanazr al inicio de la sig linea 
+						    //buscar inicio de bloque valido
+						    bool valido = false; // marcar si hay o no un bloque valido
+
+						    while ( cursor < logical_end ){
+		// buscar el @ 
+		char* at_ptr = (char*) memchr( cursor, '@', end_ptr - cursor); // buscar el sig @ a partir del cursor 
+		if ( !at_ptr ) break; // si no hay mas @ pa fuera 
+
+		//verificar q no sea un @ aleatorio, comprobar q la tercera linea sea un + 
+		char* l1_end = find_next_newline( at_ptr, end_ptr ); //buscar el final de la linea del @ 
+		if(l1_end){
+		char* l2_end = find_next_newline( l1_end + 1, end_ptr ); //buscar el final de la linea de la secuencia 
+		if (l2_end){
+			if ((l2_end +1 < end_ptr) && *(l2_end +1) == '+'){
+				//es una lectura valida 
+
+				//ahroa hay q mirar si es interleaved, si lo es, estamos en la primera lectura o en la segunda (la pareja)
+
+				if ( interleaved ){ //herramienta pa meter 2 archivos de lecturas separadas -> https://github.com/linsalrob/fastq-pair
+						    //
+						    //si es interleaved hay q mirar si es la primera lectura o la segunda , la pareja vamos 
+						    //mirar el ID a ver si va marcado que sea 1 o 2 
+					std::string_view id_view ( at_ptr, l1_end - at_ptr); // string view del id 
+											     //parsearlo a ver si tiene un 1 o un 2 
+					bool is_first = false; // de momento no espero q sea la primera 
+					if(id_view.find("/1") != std::string_view::npos || id_view.find(" 1:") != std::string_view::npos || id_view.find(" 1/") != std::string_view::npos){
+						is_first = true; //es la primera lectura de la pareja 
+					} 
+					//si parece la segunda pues la salto y busco la siguiente 
+					if (!is_first && ((id_view.find("/2") != std::string_view::npos) || (id_view.find(" 2:") != std::string_view::npos) || (id_view.find(" 2/") != std::string_view::npos))){
+						//es la segunda lectura de la pareja, la salto y busco la siguiente 
+						cursor = l2_end +1; //avanzar al inicio de la siguiente linea 
+						continue; //saltar esta lectura y buscar la siguiente 
+					}
+
+				}
+				// ahora el inicio es valido 
+				cursor = at_ptr; //avanzar el cursor al inicio del bloque valido
+				valido = true; //marcar q es inicio valido 
+				break; //salir del bucle de busqueda de bloque valido
+			}
+		}
+	}
+	//avanzar cursor 
+	cursor = at_ptr +1; //avanzar al siguiente caracter despues del @ para seguir buscando el siguiente bloque valido
+	}
+	if ( !valido ){
+		//si no hay nada valido en nuestro trozo, pues terminar 
+		munmap(	map_ptr, map_length ); //desmapear la memoria mapeada, esto es importante para liberar los recursos del sistema y evitar fugas de maemoria
+		close(fd); //cerrar el descriptor de fichero, esto es importante para liberar los recursos del sistema y evitar fugas de descriptores de ficihero
+		queue1.notify_push_over(); //notificar que ya no se van a enviar mas batches, esto es importante para que el hilo de procesamiento sepa cuando terminar y no se quede esperando indefinidamente en la cola 
+		return; //terminar la funcion, no hay nada que procesar en nuestro bloque
+	}
+
+	} 
+
+	// ahora toca parsear el bloque que dependera de si es single o paired claro 
+	size_t batch_size = config.n_reads; // numero de lecturas por batch 
+
+	//si es interleaved el batch tendria pares de lectura 
+
+	ReadBatches rb{ interleaved }; //creamos un ReadBatches con el valor de interleaved para indicar si es single o paired 
+	rb.ids.reserve(batch_size); //reservar memoria 
+	rb.seqs.reserve(batch_size); //reservar memoria 
+	if ( interleaved ){
+		rb.seqs2.reserve(batch_size); //reservar memoria para la segunda secuencia de la pareja 
+	}
+
+	while ( cursor < logical_end ){
+		if (cursor >= end_ptr) break; // archivo cortado no hay pa leer un id
+					      //lectura 1 forward 
+					      // ID 
+		char* id_start = cursor +1; // saltar el @
+		char* id_end = find_next_newline( id_start, end_ptr ); //buscar el final de la linea del ID 
+		if ( !id_end ) break; //si no hay mas lineas pa fuera
+				      //!
+				      //el ID hasta el primer espacio 
+		char* space_pos = (char*) memchr( id_start, ' ', id_end - id_start ); //buscar el primer espacio en la linea del ID
+
+
+		size_t id_len = (space_pos) ? (space_pos - id_start) : (id_end - id_start); //calcular la longitud del ID hasta el primer espacio o hasta el final de la linea si no hay espacio
+
+		rb.ids.emplace_back( id_start, id_len ); //construir el string del ID directamente desde el puntero y la longitud, esto evita copias innecesarias y mejora el rendimiento
+
+		// secuecnia 
+
+		char* seq_start = id_end +1; //inicio de la secuencia, es la siguiente linea despues del ID 
+		char* seq_end = find_next_newline( seq_start, end_ptr ); //buscar el final de la linea de la secuencia 
+		if ( !seq_end ) break; //si no hay mas lineas pa fuera 
+
+		std::string_view seq_view( seq_start, seq_end - seq_start ); //crear un string_view de la secuencia directamente desde el puntero y la longitud, esto evita copias innecesarias y mejora el rendimiento
+
+		auto dna_view = seq_view | seqan3::views::char_to< seqan3::dna4 >; //convertir el string_view a una vista de dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+
+		rb.seqs.emplace_back( dna_view.begin(), dna_view.end() ); //construir el vector de dna4 directamente desde la vista, esto evita copias innecesarias y mejora el rendimiento
+									  // skil + calidad 
+		char* plus_line_end = find_next_newline( seq_end +1, end_ptr ); //buscar el final de la linea del +
+
+		if ( !plus_line_end ) break; //si no hay mas lineas pa fuera 
+		char* qual_line_end = find_next_newline( plus_line_end +1, end_ptr ); //buscar el final de la linea de la calidad 
+		if ( !qual_line_end ) break; //si no hay mas lineas pa fuera
+
+		cursor = qual_line_end +1; //avanzar el cursor al inicio de la siguiente lectura 
+
+		//si es interleaved toca leer la pareja
+		if ( interleaved ){
+			if (cursor >= end_ptr) break; //archivo cortado/ impar raro 
+						      //ignorar el id, es el mismo pero con un 1 o un 2 
+			char* id2_end = find_next_newline( cursor, end_ptr ); //buscar el final de la linea del ID de la pareja 
+			if ( !id2_end ) break; //si no hay mas lineas pa fuera 
+
+			//seq2 
+			char* seq2_start = id2_end +1; //inicio de la secuencia de la pareja, es la siguiente linea despues del ID 
+			char* seq2_end = find_next_newline( seq2_start, end_ptr ); //buscar el final de la linea de la secuencia de la pareja 
+
+			if ( !seq2_end ) break; //si no hay mas lineas pa fuera 
+
+			std::string_view seq2_view( seq2_start, seq2_end - seq2_start ); //crear un string_view de la secuencia de la pareja directamente desde el puntero y la longitud, esto evita copias innecesarias y mejora el rendimiento
+			auto dna2_view = seq2_view | seqan3::views::char_to< seqan3::dna4 >; //convertir el string_view a una vista de dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+			rb.seqs2.emplace_back( dna2_view.begin(), dna2_view.end() ); //construir el vector de dna4 de la pareja directamente desde la vista, esto evita copias innecesarias y mejora el rendimiento
+
+			char* plus2_line_end = find_next_newline( seq2_end +1, end_ptr ); //buscar el final de la linea del + de la pareja
+			if ( !plus2_line_end ) break; //si no hay mas lineas pa fuera
+			char* qual2_line_end = find_next_newline( plus2_line_end +1, end_ptr ); //buscar el final de la linea de la calidad de la pareja
+			if ( !qual2_line_end ) break; //si no hay mas lineas pa fuera
+			cursor = qual2_line_end +1; //avanzar el cursor al inicio de la siguiente lectura, que seria la siguiente pareja
+		}
+		// enviar batch 
+		if ( rb.ids.size() >= batch_size){
+			stats.input_reads += rb.ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
+			queue1.push( std::move(rb) ) ; //enviar el batch a la cola, moviendo el ReadBatches para evitar copias innecesarias y mejorar el rendimiento
+			rb = ReadBatches{ interleaved }; //crear un nuevo ReadBatches para el siguiente lote, con el mismo valor de interleaved, esto evita copias innecesarias y mejora el rendimiento
+			rb.ids.reserve(batch_size); //reservar memoria para el nuevo lote 
+			rb.seqs.reserve(batch_size); //reservar memoria para el nuevo lote 
+			if ( interleaved ){
+				rb.seqs2.reserve(batch_size); //reservar memoria para la segunda secuencia de la pareja en el nuevo lote
+			}
+		}
+
+	}
+	// ultimo push 
+	if ( !rb.ids.empty() ){
+		stats.input_reads += rb.ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
+		queue1.push( std::move(rb) ) ; //enviar el batch a la cola, moviendo el ReadBatches para evitar copias innecesarias y mejorar el rendimiento
+	}
+	queue1.notify_push_over(); //notificar que ya no se van a enviar mas batches, esto es importante para que el hilo de procesamiento sepa cuando terminar y no se quede esperando indefinidamente en la cola 
+	munmap( map_ptr, map_length ); //desmapear la memoria mapeada, esto es importante para liberar los recursos del sistema y evitar fugas de memoria 
+	close(fd); //cerrar el descriptor de fichero, esto es importante para liberar los recursos del sistema y evitar fugas de descriptores de fichero
+
+
+
+	} catch (const std::exception& e){
+		// ATRAPAR EXCEPCIONES PARA QUE NO SE HUNDAN EN SILENCIO
+		std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: " << e.what() << "\n" << std::endl;
+		queue1.notify_push_over(); // Evitar deadlock
+	} catch(...){
+		std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: Excepción desconocida (OOM/Segfault).\n" << std::endl;
+		queue1.notify_push_over(); // Evitar deadlock
+	}
+
+	}
+	*/
+
+		/*
+		   void parse_reads_parallel( SafeQueue< ReadBatches >& queue1 , Stats& stats, Config const& config, uint64_t start, uint64_t end, int rank){
+		   try{
+		   long long lecturas_procesadas = 0;
+		//de momento implementado para simple reads para paired reads habria que sincronizar ambos archivos
+		if ( config.single_reads.empty() ){
+		return; //si no hay single reads no hay nada q hacer
+		}
+
+		std::string filename = config.single_reads[0]; //nombre del archivo 
+
+		//abrir el archivo 
+		int fd = open(filename.c_str(), O_RDONLY); //abro el archivo en modo lectura, me da un descriptor de fichero,  .c_str() es necesario para convertir el string a un puntero a char que es lo q espera open 
+
+		std::ifstream file; //stream de lectura para leer el archivo 
+
+		if (fd == -1){
+		std::cerr << "[RANK " << rank << "] Error opening file, open() fail: " << filename << std::endl; //mensaje de error si no de pude abirir el archivo 
+		return;
+		}
+
+		//obtener tamano real 
+		struct stat st; //struct para almacenar la info del archivo 
+
+		if (fstat ( fd, &st ) == -1){
+		std::cerr << "[RANK " << rank << "] Error getting file size with fstat(): " << filename << std::endl; //mensaje de error si no de pude obtener el tamano del archivo 
+		close(fd); //cerrar el descriptor de fichero antes de salir
+		return;
+		}
+
+		uint64_t file_size = st.st_size; //tamanao del archivo en bytes 
+
+		//calcular la alineacion de pagina, a mmap hay q pasarle un multiplo del tamano de pagina pa q funcione, tamano de pagina suele ser 4kB si varia , la solucion es sacarla de la confi del sistema 
+
+		long page_size = sysconf(_SC_PAGESIZE); //obtenemos el tamano de pagina del sistema con sysconf, esto es necesario para calcular la posicion de inicio alineada a pagina
+
+		uint64_t map_offset = (start / page_size) * page_size; // calcular la posicion de incio de mapeao alineada, redondear hacia abajo claro 
+
+		uint64_t local_skip = start - map_offset; //calcular cuanto hay q saltar desde el inicio pa leer la parte que nos toca 
+
+		// ahora poner un margen de seguridad para no leer fuera de memoria por si el final que nos toca leer nos quedamos a medias de una lectura 
+		// con 64 kB es mas que suficiente 
+		size_t margin = 64 * 1024; // 64kB 
+		size_t map_length = (end - map_offset) + margin; //calcular el tamano a mapear del archivo a memoria ram 
+
+		if ( map_offset + map_length > file_size ){
+		map_length = file_size - map_offset; //ajustar el tamano a mapear para no leer fuera del archivo 
+		}
+
+		//mapear el archivo a memoria RAM 
+		char* map_ptr = static_cast<char*>( mmap( nullptr, map_length, PROT_READ, MAP_PRIVATE, fd, map_offset ) ); //mmap devuelve un puntero a la memoria mapeada, el primer parametro es nullptr para que el sistema elija la direccion de memoria, el segundo es el tamano a mapear, el tercero son las protecciones (lectura), el cuarto son las banderas (MAP_PRIVATE para que los cambios no se reflejen en el archivo), el quinto es el descriptor de fichero y el sexto es el offset del archivo a mapear
+
+		if ( map_ptr == MAP_FAILED ){
+		std::cerr << "[RANK " << rank << "] Error mapping file to memory with mmap(): " << filename << std::endl; //mensaje de error si no de pude mapear el archivo a memoria ram 
+		close(fd); //cerrar el descriptor de fichero antes de salir
+		return;
+		}
+
+		//ahora para optimizar mas , como vamos a leer todo secuencialmente sin ir a saltos (la memoria mapeada ) le vamos a decir al kernel que se preprare, que va a mapear agresivamente, que meta muchos datos a memoria no vaya poco a poco que no nos vamos a saltar nada si no que vamos a leer todo de corrido y secuencialmente sin saltos 
+
+		if ( madvise( map_ptr, map_length, MADV_SEQUENTIAL | MADV_WILLNEED ) == -1 ){
+		std::cerr << "[RANK " << rank << "] Warning: madvise() failed: " << filename << std::endl; //mensaje de advertencia si no se pudo usar madvise, no es un error crítico pero puede afectar al rendimiento 
+		} // mas info en https://man7.org/linux/man-pages/man2/madvise.2.html
+
+
+		// punteros utiles 
+
+		char* cursor = map_ptr + local_skip; //puntero al inicio de la parte que nos toca leer, esto es lo que usaremos para leer el archivo 
+		char* end_ptr = map_ptr + map_length; //puntero al final de la parte que nos toca leer, esto es lo que usaremos para no leer fuera de nuestra parte asignad
+		char* logical_end = map_ptr + (end - map_offset); //puntero al final logico de nuestra parte, esto es para saber cuando hemos llegado al final de nuestra parte asignada aunque el mapa sea un poco mas grande por el margen de seguridad
+
+		if( start > 0 ){
+			// si no empezamos al principio, buscar la primera sig linea 
+
+			//toca buscar el siguiente encabezado (@) para empezar, simplemente toca avabzar
+			while ( cursor < end_ptr && *cursor != '\n' )
+				cursor++; //avanzar hasta el final de la linea actual
+			if ( cursor < end_ptr){
+				cursor++; //avanzar al inicio de la siguiente linea
+			}
+			//buscar el patron de inici '@'
+			while ( cursor < logical_end){
+				if (*cursor == '@')
+					break; //inicio de linea encontrado 
+				while (cursor < end_ptr && *cursor != '\n')
+					cursor++; //avanzar hasta el final de la linea actual
+				if (cursor < end_ptr){
+					cursor++; //avanzar al inicio de la siguiente linea
+				}
+			}
+		}	
+
+	//reservar memoria para evitar que el vector se redimensione constantemente y disminuya el rendimiento 
+	size_t batch_size = config.n_reads; // numero de lecturas por batch 
+
+	//toca leer hasta final de bloque o mas para no cortar ninguna lectura 
+	std::vector< std::string > ids;
+	std::vector< std::vector< seqan3::dna4 > > seqs;
+
+	ids.reserve(batch_size); 
+	seqs.reserve(batch_size);
+
+	//parsear el bloque 
+	while ( cursor < logical_end){
+		if ( cursor >= end_ptr)
+			break; //llegamos al final 
+			       //leer el ID 
+		if (*cursor != '@'){
+			while (cursor < end_ptr && *cursor != '\n')
+				cursor++; //avanzar hasta el final de la linea actual
+			cursor++; continue; 
+		}
+
+		//saltar el '@'
+		cursor++;
+
+		char* id_start = cursor; //inicio del id_start 
+		while ( cursor < end_ptr && *cursor != '\n')
+			cursor++; //avanzar hasta el final de la linea actual 
+				  //copiar el id al vector 
+		ids.emplace_back( id_start, cursor - id_start ); //construir el string directamente desde el puntero y la longitud, esto evita copias innecesarias y mejora el rendimiento
+		cursor++; //avanzar, saltar el '\n'
+			  //leer la secuencialmente
+			  //
+		char* seq_start = cursor; //inicio de la secuencia 
+		while ( cursor < end_ptr && *cursor != '\n')
+			cursor++; //avanzar hasta el final de la linea actual
+		size_t seq_len = cursor - seq_start; //longitud de la secuencialmente
+
+		//usare string_view para no copiar la cadena si no pasarle el puntero directamente a seqan3 
+		std::string_view seq_view( seq_start, seq_len ); //crear un string_view directamente desde el puntero y la longitud, esto evita copias innecesarias y mejora el rendimiento
+		auto dna_view = seq_view | seqan3::views::char_to< seqan3::dna4 >; //convertir el string_view a una vista de dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
+		seqs.emplace_back( dna_view.begin(), dna_view.end() ); //construir el vector de dna4 directamente desde la vista, esto evita copias innecesarias y mejora el rendimiento
+		cursor++; //avanzar, saltar el '\n'
+
+		// el +, la linea del separador 
+		while ( cursor < end_ptr && *cursor != '\n')
+			cursor++; //avanzar hasta el final de la linea actual
+
+		//la calidad 
+		while ( cursor < end_ptr && *cursor != '\n')
+			cursor++; //avanzar hasta el final de la linea actual 
+		cursor++; 
+
+		//enviar el batch 
+
+		if ( ids.size() >= batch_size ){
+			stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el lote actual
+			queue1.push( ReadBatches( false, std::move(ids), std::move(seqs) ) ) ; //enviamos el lote a la cola, moviendo los vectores para evitar copias y mejorar el rendimiento
+			ids.clear(); //limpiar el vector de ids para el siguiente lote 
+			seqs.clear(); //limpiar el vector de secuencias para el siguiente lote
+		}
+	}
+
+
+	// ahora toca enviar el ultimo lote que no esta completo 
+	if ( !ids.empty() ){
+		stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el ultimo lote
+		queue1.push( ReadBatches( false, std::move(ids), std::move(seqs) ) ) ; //enviamos el ultimo lote a la cola
+	}
+	//notificar a al consumidor (cola) q no hay na mas 
+	queue1.notify_push_over(); // no se van a meter mas lotes
+
+	//limpiar, demapear la memoria 
+	if ( munmap( map_ptr, map_length ) == -1 ){
+		std::cerr << "[RANK " << rank << "] Warning: munmap() failed: " << filename << std::endl; //mensaje de advertencia si no se pudo demapear la memoria, no es un error crítico pero puede afectar al rendimiento 
+	}
+	close(fd); //cerrar el descriptor de fichero
+
+	} catch (const std::exception& e){
+		// ATRAPAR EXCEPCIONES PARA QUE NO SE HUNDAN EN SILENCIO
+		std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: " << e.what() << "\n" << std::endl;
+		queue1.notify_push_over(); // Evitar deadlock
+	} catch(...){
+		std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: Excepción desconocida (OOM/Segfault).\n" << std::endl;
+		queue1.notify_push_over(); // Evitar deadlock
+	}
+	}
+
+	*/
+
 		std::map< std::string, HierarchyConfig > parse_hierarchy( Config& config )
 		{
 
@@ -387,803 +965,803 @@ namespace GanonClassify
 			return parsed_hierarchy;
 		}
 
-		void print_hierarchy( Config const& config, auto const& parsed_hierarchy )
-		{
+	void print_hierarchy( Config const& config, auto const& parsed_hierarchy )
+	{
 
-			constexpr auto newl{ "\n" };
-			for ( auto const& hierarchy_config : parsed_hierarchy )
+		constexpr auto newl{ "\n" };
+		for ( auto const& hierarchy_config : parsed_hierarchy )
+		{
+			std::cerr << hierarchy_config.first << newl;
+			std::cerr << "--rel-filter " << hierarchy_config.second.rel_filter << newl;
+			std::cerr << "--fpr-query " << hierarchy_config.second.fpr_query << newl;
+			for ( auto const& filter_config : hierarchy_config.second.filters )
 			{
-				std::cerr << hierarchy_config.first << newl;
-				std::cerr << "--rel-filter " << hierarchy_config.second.rel_filter << newl;
-				std::cerr << "--fpr-query " << hierarchy_config.second.fpr_query << newl;
-				for ( auto const& filter_config : hierarchy_config.second.filters )
+				std::cerr << "    " << filter_config.ibf_file;
+				if ( !filter_config.tax_file.empty() )
+					std::cerr << ", " << filter_config.tax_file;
+				if ( filter_config.rel_cutoff > -1 )
+					std::cerr << " --rel-cutoff " << filter_config.rel_cutoff;
+				std::cerr << newl;
+			}
+			if ( !config.output_prefix.empty() )
+			{
+				std::cerr << "    Output files: ";
+				std::cerr << config.output_prefix + ".rep";
+				if ( config.output_lca )
+					std::cerr << ", " << hierarchy_config.second.output_file_lca;
+				if ( config.output_all )
+					std::cerr << ", " << hierarchy_config.second.output_file_all;
+				std::cerr << newl;
+			}
+		}
+		std::cerr << "----------------------------------------------------------------------" << newl;
+	}
+
+	inline TRep sum_reports( std::vector< TRep > const& reports )
+	{
+		TRep report_sum;
+		for ( auto const& report : reports )
+		{
+			for ( auto const& [target, r] : report )
+			{
+				report_sum[target].matches += r.matches;
+				report_sum[target].lca_reads += r.lca_reads;
+				report_sum[target].unique_reads += r.unique_reads;
+			}
+		}
+		return report_sum;
+	}
+
+	inline size_t threshold_rel( size_t n_hashes, double p )
+	{
+		return std::ceil( n_hashes * p );
+	}
+
+	// https://stackoverflow.com/questions/44718971/calculate-binomial-coffeficient-very-reliably
+	inline double binom( double n, double k ) noexcept
+	{
+		return std::exp( std::lgamma( n + 1 ) - std::lgamma( n - k + 1 ) - std::lgamma( k + 1 ) );
+	}
+
+
+	void select_matches( Filter< TIBF >&        filter,
+			TMatches&              matches,
+			std::vector< size_t >& hashes,
+			auto&                  agent,
+			size_t                 threshold_cutoff,
+			size_t&                max_count_read,
+			size_t&                min_count_read,
+			size_t                 n_hashes )
+	{
+		// Count every occurrence on IBF
+		seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes );
+
+		for ( auto const& [target, bins] : filter.map )
+		{
+			// Sum counts among bins (split target (user bins) into several technical bins)
+			size_t summed_count = 0;
+			for ( auto const& binno : bins )
+			{
+				summed_count += counts[binno];
+			}
+			// summed_count can be higher than n_hashes for matches in several technical bins
+			if ( summed_count > n_hashes )
+				summed_count = n_hashes;
+			if ( summed_count >= threshold_cutoff )
+			{
+				// ensure that count was not already found for target with higher count
+				// can happen in case of ambiguos targets in multiple filters
+				if ( summed_count > std::get< 0 >( matches[target] ) )
 				{
-					std::cerr << "    " << filter_config.ibf_file;
-					if ( !filter_config.tax_file.empty() )
-						std::cerr << ", " << filter_config.tax_file;
-					if ( filter_config.rel_cutoff > -1 )
-						std::cerr << " --rel-cutoff " << filter_config.rel_cutoff;
-					std::cerr << newl;
-				}
-				if ( !config.output_prefix.empty() )
-				{
-					std::cerr << "    Output files: ";
-					std::cerr << config.output_prefix + ".rep";
-					if ( config.output_lca )
-						std::cerr << ", " << hierarchy_config.second.output_file_lca;
-					if ( config.output_all )
-						std::cerr << ", " << hierarchy_config.second.output_file_all;
-					std::cerr << newl;
+					matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
+					if ( summed_count > max_count_read )
+						max_count_read = summed_count;
+					if ( summed_count < min_count_read )
+						min_count_read = summed_count;
 				}
 			}
-			std::cerr << "----------------------------------------------------------------------" << newl;
 		}
+	}
 
-		inline TRep sum_reports( std::vector< TRep > const& reports )
+	void select_matches( Filter< THIBF >&       filter,
+			TMatches&              matches,
+			std::vector< size_t >& hashes,
+			auto&                  agent,
+			size_t                 threshold_cutoff,
+			size_t&                max_count_read,
+			size_t&                min_count_read,
+			size_t                 n_hashes )
+	{
+		// Count only matches above threhsold
+		seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes, threshold_cutoff );
+
+		// Only one bin per target
+		for ( auto const& [target, bins] : filter.map )
 		{
-			TRep report_sum;
-			for ( auto const& report : reports )
-			{
-				for ( auto const& [target, r] : report )
-				{
-					report_sum[target].matches += r.matches;
-					report_sum[target].lca_reads += r.lca_reads;
-					report_sum[target].unique_reads += r.unique_reads;
-				}
-			}
-			return report_sum;
-		}
-
-		inline size_t threshold_rel( size_t n_hashes, double p )
-		{
-			return std::ceil( n_hashes * p );
-		}
-
-		// https://stackoverflow.com/questions/44718971/calculate-binomial-coffeficient-very-reliably
-		inline double binom( double n, double k ) noexcept
-		{
-			return std::exp( std::lgamma( n + 1 ) - std::lgamma( n - k + 1 ) - std::lgamma( k + 1 ) );
-		}
-
-
-		void select_matches( Filter< TIBF >&        filter,
-				TMatches&              matches,
-				std::vector< size_t >& hashes,
-				auto&                  agent,
-				size_t                 threshold_cutoff,
-				size_t&                max_count_read,
-				size_t&                min_count_read,
-				size_t                 n_hashes )
-		{
-			// Count every occurrence on IBF
-			seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes );
-
-			for ( auto const& [target, bins] : filter.map )
+			if ( counts[bins[0]] > 0 )
 			{
 				// Sum counts among bins (split target (user bins) into several technical bins)
-				size_t summed_count = 0;
-				for ( auto const& binno : bins )
-				{
-					summed_count += counts[binno];
-				}
+				size_t summed_count = counts[bins[0]];
 				// summed_count can be higher than n_hashes for matches in several technical bins
 				if ( summed_count > n_hashes )
 					summed_count = n_hashes;
-				if ( summed_count >= threshold_cutoff )
+				// ensure that count was not already found for target with higher count
+				// can happen in case of ambiguous targets in multiple filters
+				if ( summed_count > std::get< 0 >( matches[target] ) )
 				{
-					// ensure that count was not already found for target with higher count
-					// can happen in case of ambiguos targets in multiple filters
-					if ( summed_count > std::get< 0 >( matches[target] ) )
-					{
-						matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
-						if ( summed_count > max_count_read )
-							max_count_read = summed_count;
-						if ( summed_count < min_count_read )
-							min_count_read = summed_count;
-					}
+					matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
+					if ( summed_count > max_count_read )
+						max_count_read = summed_count;
+					if ( summed_count < min_count_read )
+						min_count_read = summed_count;
 				}
 			}
 		}
+	}
 
-		void select_matches( Filter< THIBF >&       filter,
-				TMatches&              matches,
-				std::vector< size_t >& hashes,
-				auto&                  agent,
-				size_t                 threshold_cutoff,
-				size_t&                max_count_read,
-				size_t&                min_count_read,
-				size_t                 n_hashes )
+	size_t filter_matches(
+			ReadOut& read_out, TMatches& matches, TRep& rep, size_t n_hashes, double threshold_filter, double min_fpr_query )
+	{
+
+		for ( auto const& [target, count_fpr] : matches )
 		{
-			// Count only matches above threhsold
-			seqan3::counting_vector< detail::TIntCount > counts = agent.bulk_count( hashes, threshold_cutoff );
-
-			// Only one bin per target
-			for ( auto const& [target, bins] : filter.map )
+			if ( std::get< 0 >( count_fpr ) >= threshold_filter )
 			{
-				if ( counts[bins[0]] > 0 )
+				// Filter by fpr-query
+				if ( min_fpr_query < 1.0 )
 				{
-					// Sum counts among bins (split target (user bins) into several technical bins)
-					size_t summed_count = counts[bins[0]];
-					// summed_count can be higher than n_hashes for matches in several technical bins
-					if ( summed_count > n_hashes )
-						summed_count = n_hashes;
-					// ensure that count was not already found for target with higher count
-					// can happen in case of ambiguous targets in multiple filters
-					if ( summed_count > std::get< 0 >( matches[target] ) )
+					double q = 1;
+					for ( size_t i = 0; i <= std::get< 0 >( count_fpr ); i++ )
 					{
-						matches[target] = std::make_tuple( summed_count, filter.filter_config.target_fpr[target] );
-						if ( summed_count > max_count_read )
-							max_count_read = summed_count;
-						if ( summed_count < min_count_read )
-							min_count_read = summed_count;
+						q -= binom( n_hashes, i ) * pow( std::get< 1 >( count_fpr ), i )
+							* pow( 1 - std::get< 1 >( count_fpr ), n_hashes - i );
+					}
+					if ( q > min_fpr_query )
+					{
+						continue;
 					}
 				}
+
+				rep[target].matches++;
+				read_out.matches.push_back( ReadMatch{ target, std::get< 0 >( count_fpr ) } );
 			}
 		}
 
-		size_t filter_matches(
-				ReadOut& read_out, TMatches& matches, TRep& rep, size_t n_hashes, double threshold_filter, double min_fpr_query )
+		return read_out.matches.size();
+	}
+
+	void lca_matches( ReadOut& read_out, ReadOut& read_out_lca, size_t max_count_read, LCA& lca, TRep& rep )
+	{
+
+		std::vector< std::string > targets;
+		for ( auto const& r : read_out.matches )
+		{
+			targets.push_back( r.target );
+		}
+
+		std::string target_lca = lca.getLCA( targets );
+		rep[target_lca].lca_reads++;
+		read_out_lca.matches.push_back( ReadMatch{ target_lca, max_count_read } );
+	}
+
+
+	template < typename TFilter >
+		void classify( std::vector< Filter< TFilter > >& filters,
+				LCA&                              lca,
+				TRep&                             rep,
+				Total&                            total,
+				SafeQueue< ReadOut >&             classified_all_queue,
+				SafeQueue< ReadOut >&             classified_lca_queue,
+				SafeQueue< ReadOut >&             unclassified_queue,
+				Config const&                     config,
+				SafeQueue< ReadBatches >*         pointer_current,
+				SafeQueue< ReadBatches >*         pointer_helper,
+				HierarchyConfig const&            hierarchy_config,
+				bool                              hierarchy_first,
+				bool                              hierarchy_last )
 		{
 
-			for ( auto const& [target, count_fpr] : matches )
+			// oner hash adaptor per thread
+			const auto minimiser_hash =
+				seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ hierarchy_config.kmer_size } },
+						seqan3::window_size{ hierarchy_config.window_size },
+						seqan3::seed{ raptor::adjust_seed( hierarchy_config.kmer_size ) } );
+
+			// one agent per thread per filter
+			using TAgent = std::conditional_t< std::same_as< TFilter, THIBF >,
+			      THIBF::counting_agent_type< detail::TIntCount >,
+			      TIBF::counting_agent_type< detail::TIntCount > >;
+			std::vector< TAgent > agents;
+			for ( Filter< TFilter >& filter : filters )
 			{
-				if ( std::get< 0 >( count_fpr ) >= threshold_filter )
+				agents.push_back( filter.ibf.template counting_agent< detail::TIntCount >() );
+			}
+
+			while ( true )
+			{
+				// Wait here until reads are available or push is over and queue is empty
+				ReadBatches rb = pointer_current->pop();
+
+				// If batch is empty exit thread
+				if ( rb.ids.empty() )
+					break;
+
+				// store unclassified reads for next iteration
+				ReadBatches left_over_reads{ rb.paired };
+
+				const size_t hashes_limit = std::numeric_limits< detail::TIntCount >::max();
+
+				for ( size_t readID = 0; readID < rb.ids.size(); ++readID )
 				{
-					// Filter by fpr-query
-					if ( min_fpr_query < 1.0 )
+					// read lenghts
+					const size_t read1_len = rb.seqs[readID].size();
+					const size_t read2_len = rb.paired ? rb.seqs2[readID].size() : 0;
+
+					// Store matches for this read
+					TMatches matches;
+
+					// Best scoring kmer count
+					size_t max_count_read = 0;
+					size_t min_count_read = 0;
+					size_t n_hashes       = 0;
+					// if length is smaller than window, skip read
+					if ( read1_len >= hierarchy_config.window_size )
 					{
-						double q = 1;
-						for ( size_t i = 0; i <= std::get< 0 >( count_fpr ); i++ )
+						// Count hashes
+						std::vector< size_t > hashes = rb.seqs[readID] | minimiser_hash | seqan3::ranges::to< std::vector >();
+						// Count hashes from both pairs if second is given
+						if ( read2_len >= hierarchy_config.window_size )
 						{
-							q -= binom( n_hashes, i ) * pow( std::get< 1 >( count_fpr ), i )
-								* pow( 1 - std::get< 1 >( count_fpr ), n_hashes - i );
+							// Add hashes of second pair
+							const auto h2 = rb.seqs2[readID] | minimiser_hash | std::views::common;
+							hashes.insert( hashes.end(), h2.begin(), h2.end() );
 						}
-						if ( q > min_fpr_query )
+
+						n_hashes = hashes.size();
+						// set min as max. possible hashes
+						min_count_read = n_hashes;
+						// if n_hashes are bigger than int limit, skip read
+						if ( n_hashes <= hashes_limit )
 						{
+							// Sum sequence to totals
+							if ( hierarchy_first )
+							{
+								total.reads_processed++;
+								total.length_processed += read1_len + read2_len;
+							}
+
+							// For each filter in the hierarchy
+							for ( size_t i = 0; i < filters.size(); ++i )
+							{
+								// Calculate threshold for cutoff (keep matches above)
+								size_t threshold_cutoff = threshold_rel( n_hashes, filters[i].filter_config.rel_cutoff );
+
+								// reset low threshold_cutoff to just one kmer (0 would match everywhere)
+								if ( threshold_cutoff == 0 )
+									threshold_cutoff = 1;
+
+								// count and select matches
+								select_matches( filters[i],
+										matches,
+										hashes,
+										agents[i],
+										threshold_cutoff,
+										max_count_read,
+										min_count_read,
+										n_hashes );
+							}
+						}
+					}
+
+					// store read and matches to be printed
+					ReadOut read_out( rb.ids[readID] );
+
+					// if read got valid matches (above cutoff)
+					if ( max_count_read > 0 )
+					{
+
+						// Calculate threshold for filtering (keep matches above)
+						const size_t threshold_filter =
+							max_count_read - threshold_rel( max_count_read - min_count_read, hierarchy_config.rel_filter );
+
+						// Filter matches
+						const size_t count_filtered_matches =
+							filter_matches( read_out, matches, rep, n_hashes, threshold_filter, hierarchy_config.fpr_query );
+
+						if ( count_filtered_matches > 0 )
+						{
+
+							total.reads_classified++;
+
+							if ( !config.skip_lca )
+							{
+								ReadOut read_out_lca( rb.ids[readID] );
+								if ( count_filtered_matches == 1 )
+								{
+									// just one match, copy read read_out and set as unique
+									read_out_lca = read_out;
+									rep[read_out.matches[0].target].unique_reads++;
+								}
+								else
+								{
+									lca_matches( read_out, read_out_lca, max_count_read, lca, rep );
+								}
+
+								if ( config.output_lca )
+									classified_lca_queue.push( read_out_lca );
+							}
+							else
+							{
+								// Not running lca and has unique match
+								if ( count_filtered_matches == 1 )
+								{
+									rep[read_out.matches[0].target].unique_reads++;
+								}
+								else
+								{
+									// without tax, no lca, count multi-matches to a root node
+									// to keep consistency among reports (no. of classified reads)
+									rep[config.tax_root_node].lca_reads++;
+								}
+							}
+
+							if ( config.output_all )
+								classified_all_queue.push( read_out );
+
+							// read classified, continue to the next
 							continue;
 						}
 					}
 
-					rep[target].matches++;
-					read_out.matches.push_back( ReadMatch{ target, std::get< 0 >( count_fpr ) } );
-				}
-			}
-
-			return read_out.matches.size();
-		}
-
-		void lca_matches( ReadOut& read_out, ReadOut& read_out_lca, size_t max_count_read, LCA& lca, TRep& rep )
-		{
-
-			std::vector< std::string > targets;
-			for ( auto const& r : read_out.matches )
-			{
-				targets.push_back( r.target );
-			}
-
-			std::string target_lca = lca.getLCA( targets );
-			rep[target_lca].lca_reads++;
-			read_out_lca.matches.push_back( ReadMatch{ target_lca, max_count_read } );
-		}
-
-
-		template < typename TFilter >
-			void classify( std::vector< Filter< TFilter > >& filters,
-					LCA&                              lca,
-					TRep&                             rep,
-					Total&                            total,
-					SafeQueue< ReadOut >&             classified_all_queue,
-					SafeQueue< ReadOut >&             classified_lca_queue,
-					SafeQueue< ReadOut >&             unclassified_queue,
-					Config const&                     config,
-					SafeQueue< ReadBatches >*         pointer_current,
-					SafeQueue< ReadBatches >*         pointer_helper,
-					HierarchyConfig const&            hierarchy_config,
-					bool                              hierarchy_first,
-					bool                              hierarchy_last )
-			{
-
-				// oner hash adaptor per thread
-				const auto minimiser_hash =
-					seqan3::views::minimiser_hash( seqan3::shape{ seqan3::ungapped{ hierarchy_config.kmer_size } },
-							seqan3::window_size{ hierarchy_config.window_size },
-							seqan3::seed{ raptor::adjust_seed( hierarchy_config.kmer_size ) } );
-
-				// one agent per thread per filter
-				using TAgent = std::conditional_t< std::same_as< TFilter, THIBF >,
-				      THIBF::counting_agent_type< detail::TIntCount >,
-				      TIBF::counting_agent_type< detail::TIntCount > >;
-				std::vector< TAgent > agents;
-				for ( Filter< TFilter >& filter : filters )
-				{
-					agents.push_back( filter.ibf.template counting_agent< detail::TIntCount >() );
-				}
-
-				while ( true )
-				{
-					// Wait here until reads are available or push is over and queue is empty
-					ReadBatches rb = pointer_current->pop();
-
-					// If batch is empty exit thread
-					if ( rb.ids.empty() )
-						break;
-
-					// store unclassified reads for next iteration
-					ReadBatches left_over_reads{ rb.paired };
-
-					const size_t hashes_limit = std::numeric_limits< detail::TIntCount >::max();
-
-					for ( size_t readID = 0; readID < rb.ids.size(); ++readID )
+					// not classified
+					if ( !hierarchy_last ) // if there is more levels, store read
 					{
-						// read lenghts
-						const size_t read1_len = rb.seqs[readID].size();
-						const size_t read2_len = rb.paired ? rb.seqs2[readID].size() : 0;
+						left_over_reads.ids.push_back( std::move( rb.ids[readID] ) );
+						left_over_reads.seqs.push_back( std::move( rb.seqs[readID] ) );
 
-						// Store matches for this read
-						TMatches matches;
-
-						// Best scoring kmer count
-						size_t max_count_read = 0;
-						size_t min_count_read = 0;
-						size_t n_hashes       = 0;
-						// if length is smaller than window, skip read
-						if ( read1_len >= hierarchy_config.window_size )
+						if ( rb.paired )
 						{
-							// Count hashes
-							std::vector< size_t > hashes = rb.seqs[readID] | minimiser_hash | seqan3::ranges::to< std::vector >();
-							// Count hashes from both pairs if second is given
-							if ( read2_len >= hierarchy_config.window_size )
-							{
-								// Add hashes of second pair
-								const auto h2 = rb.seqs2[readID] | minimiser_hash | std::views::common;
-								hashes.insert( hashes.end(), h2.begin(), h2.end() );
-							}
-
-							n_hashes = hashes.size();
-							// set min as max. possible hashes
-							min_count_read = n_hashes;
-							// if n_hashes are bigger than int limit, skip read
-							if ( n_hashes <= hashes_limit )
-							{
-								// Sum sequence to totals
-								if ( hierarchy_first )
-								{
-									total.reads_processed++;
-									total.length_processed += read1_len + read2_len;
-								}
-
-								// For each filter in the hierarchy
-								for ( size_t i = 0; i < filters.size(); ++i )
-								{
-									// Calculate threshold for cutoff (keep matches above)
-									size_t threshold_cutoff = threshold_rel( n_hashes, filters[i].filter_config.rel_cutoff );
-
-									// reset low threshold_cutoff to just one kmer (0 would match everywhere)
-									if ( threshold_cutoff == 0 )
-										threshold_cutoff = 1;
-
-									// count and select matches
-									select_matches( filters[i],
-											matches,
-											hashes,
-											agents[i],
-											threshold_cutoff,
-											max_count_read,
-											min_count_read,
-											n_hashes );
-								}
-							}
-						}
-
-						// store read and matches to be printed
-						ReadOut read_out( rb.ids[readID] );
-
-						// if read got valid matches (above cutoff)
-						if ( max_count_read > 0 )
-						{
-
-							// Calculate threshold for filtering (keep matches above)
-							const size_t threshold_filter =
-								max_count_read - threshold_rel( max_count_read - min_count_read, hierarchy_config.rel_filter );
-
-							// Filter matches
-							const size_t count_filtered_matches =
-								filter_matches( read_out, matches, rep, n_hashes, threshold_filter, hierarchy_config.fpr_query );
-
-							if ( count_filtered_matches > 0 )
-							{
-
-								total.reads_classified++;
-
-								if ( !config.skip_lca )
-								{
-									ReadOut read_out_lca( rb.ids[readID] );
-									if ( count_filtered_matches == 1 )
-									{
-										// just one match, copy read read_out and set as unique
-										read_out_lca = read_out;
-										rep[read_out.matches[0].target].unique_reads++;
-									}
-									else
-									{
-										lca_matches( read_out, read_out_lca, max_count_read, lca, rep );
-									}
-
-									if ( config.output_lca )
-										classified_lca_queue.push( read_out_lca );
-								}
-								else
-								{
-									// Not running lca and has unique match
-									if ( count_filtered_matches == 1 )
-									{
-										rep[read_out.matches[0].target].unique_reads++;
-									}
-									else
-									{
-										// without tax, no lca, count multi-matches to a root node
-										// to keep consistency among reports (no. of classified reads)
-										rep[config.tax_root_node].lca_reads++;
-									}
-								}
-
-								if ( config.output_all )
-									classified_all_queue.push( read_out );
-
-								// read classified, continue to the next
-								continue;
-							}
-						}
-
-						// not classified
-						if ( !hierarchy_last ) // if there is more levels, store read
-						{
-							left_over_reads.ids.push_back( std::move( rb.ids[readID] ) );
-							left_over_reads.seqs.push_back( std::move( rb.seqs[readID] ) );
-
-							if ( rb.paired )
-							{
-								// seqan::appendValue( left_over_reads.seqs2, rb.seqs2[readID] );
-								left_over_reads.seqs2.push_back( std::move( rb.seqs2[readID] ) );
-							}
-						}
-						else if ( config.output_unclassified ) // no more levels and no classification, add to
-										       // unclassified printing queue
-						{
-							unclassified_queue.push( read_out );
+							// seqan::appendValue( left_over_reads.seqs2, rb.seqs2[readID] );
+							left_over_reads.seqs2.push_back( std::move( rb.seqs2[readID] ) );
 						}
 					}
-
-					// if there are more levels to classify and something was left, keep reads in memory
-					if ( !hierarchy_last && left_over_reads.ids.size() > 0 )
-						pointer_helper->push( std::move( left_over_reads ) );
-				}
-			}
-
-		void write_report( TRep& rep, TTax& tax, std::ofstream& out_rep, std::string hierarchy_label )
-		{
-			for ( auto const& [target, report] : rep )
-			{
-				if ( report.matches || report.lca_reads || report.unique_reads )
-				{
-					out_rep << hierarchy_label << '\t' << target << '\t' << report.matches << '\t' << report.unique_reads
-						<< '\t' << report.lca_reads;
-
-					if ( !tax.empty() )
+					else if ( config.output_unclassified ) // no more levels and no classification, add to
+									       // unclassified printing queue
 					{
-						out_rep << '\t' << tax.at( target ).rank << '\t' << tax.at( target ).name;
+						unclassified_queue.push( read_out );
 					}
-					out_rep << '\n';
 				}
+
+				// if there are more levels to classify and something was left, keep reads in memory
+				if ( !hierarchy_last && left_over_reads.ids.size() > 0 )
+					pointer_helper->push( std::move( left_over_reads ) );
 			}
 		}
 
-		static inline void replace_all( std::string& str, const std::string& from, const std::string& to )
+	void write_report( TRep& rep, TTax& tax, std::ofstream& out_rep, std::string hierarchy_label )
+	{
+		for ( auto const& [target, report] : rep )
 		{
-			size_t start_pos = 0;
-			while ( ( start_pos = str.find( from, start_pos ) ) != std::string::npos )
+			if ( report.matches || report.lca_reads || report.unique_reads )
 			{
-				str.replace( start_pos, from.length(), to );
-				start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
-			}
-		}
+				out_rep << hierarchy_label << '\t' << target << '\t' << report.matches << '\t' << report.unique_reads
+					<< '\t' << report.lca_reads;
 
-		size_t load_filter( THIBF&             filter,
-				IBFConfig&         ibf_config,
-				TBinMap&           bin_map,
-				std::string const& input_filter_file,
-				TTargetFpr&        target_fpr )
-		{
-			std::ifstream              is( input_filter_file, std::ios::binary );
-			cereal::BinaryInputArchive archive( is );
-
-			uint32_t                                  parsed_version;
-			uint64_t                                  window_size;
-			seqan3::shape                             shape{};
-			uint8_t                                   parts;
-			bool                                      compressed;
-			std::vector< std::vector< std::string > > bin_path{};
-			double                                    fpr{};
-			bool                                      is_hibf{};
-
-			archive( parsed_version );
-			archive( window_size );
-			archive( shape );
-			archive( parts );
-			archive( compressed );
-			archive( bin_path );
-			archive( fpr );
-			archive( is_hibf );
-			archive( filter );
-
-			// load ibf_config from raptor params
-			ibf_config.window_size = window_size;
-			ibf_config.kmer_size   = shape.count();
-			ibf_config.max_fp      = fpr;
-
-			// Create map from paths
-			size_t binno{};
-			for ( auto const& file_list : bin_path )
-			{
-				for ( auto const& filename : file_list )
+				if ( !tax.empty() )
 				{
-					// based on the filename, get target.minimiser
-					// (e.g. 562.minimiser or GCF_013391805.1.minimiser), otherwise use filename as target
-					auto   f     = std::filesystem::path( filename ).filename().string();
-					size_t found = f.find( ".minimiser" );
-					if ( found != std::string::npos )
-						f = f.substr( 0, found );
-
-					// workaround when file has a . (e.g. GCF_013391805.1)
-					// "." replaced by "|||" in ganon build wrapper
-					// fixed on ganon v2.0.0 (+ raptor 3.0.1) but kept for compatibility (>= ganon v1.8.0)
-					replace_all( f, "|||", "." );
-
-					// workaround when target has a space (e.g. s__Pectobacterium carotovorum)
-					// " " replaced by "---" in ganon build wrapper
-					replace_all( f, "---", " " );
-
-					bin_map.push_back( std::make_tuple( binno, f ) );
-					// same fpr for all
-					target_fpr[f] = fpr;
+					out_rep << '\t' << tax.at( target ).rank << '\t' << tax.at( target ).name;
 				}
-				++binno;
+				out_rep << '\n';
 			}
-
-			return filter.user_bins.num_user_bins();
 		}
+	}
 
-		inline double false_positive( uint64_t bin_size_bits, uint8_t hash_functions, uint64_t n_hashes )
+	static inline void replace_all( std::string& str, const std::string& from, const std::string& to )
+	{
+		size_t start_pos = 0;
+		while ( ( start_pos = str.find( from, start_pos ) ) != std::string::npos )
 		{
-			/*
-			 * calculates the theoretical false positive of a bin (bf) based on parameters
-			 */
-			return std::pow( 1 - std::exp( -hash_functions / ( bin_size_bits / static_cast< double >( n_hashes ) ) ),
-					hash_functions );
+			str.replace( start_pos, from.length(), to );
+			start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
 		}
+	}
 
-		size_t load_filter( TIBF&              filter,
-				IBFConfig&         ibf_config,
-				TBinMap&           bin_map,
-				std::string const& input_filter_file,
-				TTargetFpr&        target_fpr )
+	size_t load_filter( THIBF&             filter,
+			IBFConfig&         ibf_config,
+			TBinMap&           bin_map,
+			std::string const& input_filter_file,
+			TTargetFpr&        target_fpr )
+	{
+		std::ifstream              is( input_filter_file, std::ios::binary );
+		cereal::BinaryInputArchive archive( is );
+
+		uint32_t                                  parsed_version;
+		uint64_t                                  window_size;
+		seqan3::shape                             shape{};
+		uint8_t                                   parts;
+		bool                                      compressed;
+		std::vector< std::vector< std::string > > bin_path{};
+		double                                    fpr{};
+		bool                                      is_hibf{};
+
+		archive( parsed_version );
+		archive( window_size );
+		archive( shape );
+		archive( parts );
+		archive( compressed );
+		archive( bin_path );
+		archive( fpr );
+		archive( is_hibf );
+		archive( filter );
+
+		// load ibf_config from raptor params
+		ibf_config.window_size = window_size;
+		ibf_config.kmer_size   = shape.count();
+		ibf_config.max_fp      = fpr;
+
+		// Create map from paths
+		size_t binno{};
+		for ( auto const& file_list : bin_path )
 		{
-			std::ifstream              is( input_filter_file, std::ios::binary );
-			cereal::BinaryInputArchive archive( is );
-
-			std::tuple< int, int, int >                        parsed_version;
-			std::vector< std::tuple< std::string, uint64_t > > hashes_count_std;
-
-			archive( parsed_version );
-			archive( ibf_config );
-			archive( hashes_count_std );
-			archive( bin_map );
-			archive( filter );
-
-
-			// generate fpr for each bin
-			for ( auto const& [target, count] : hashes_count_std )
+			for ( auto const& filename : file_list )
 			{
-				// Use average number of hashes for each bin to calculate fp
-				uint64_t n_bins_target = std::ceil( count / static_cast< double >( ibf_config.max_hashes_bin ) );
-				// this can be off by a very small number (rounding ceil on multiple bins)
-				uint64_t n_hashes_bin = std::ceil( count / static_cast< double >( n_bins_target ) );
+				// based on the filename, get target.minimiser
+				// (e.g. 562.minimiser or GCF_013391805.1.minimiser), otherwise use filename as target
+				auto   f     = std::filesystem::path( filename ).filename().string();
+				size_t found = f.find( ".minimiser" );
+				if ( found != std::string::npos )
+					f = f.substr( 0, found );
 
-				// false positive for the current target, considering split bins
-				target_fpr[target] =
-					1.0
-					- std::pow( 1.0 - false_positive( ibf_config.bin_size_bits, ibf_config.hash_functions, n_hashes_bin ),
-							n_bins_target );
-				;
+				// workaround when file has a . (e.g. GCF_013391805.1)
+				// "." replaced by "|||" in ganon build wrapper
+				// fixed on ganon v2.0.0 (+ raptor 3.0.1) but kept for compatibility (>= ganon v1.8.0)
+				replace_all( f, "|||", "." );
+
+				// workaround when target has a space (e.g. s__Pectobacterium carotovorum)
+				// " " replaced by "---" in ganon build wrapper
+				replace_all( f, "---", " " );
+
+				bin_map.push_back( std::make_tuple( binno, f ) );
+				// same fpr for all
+				target_fpr[f] = fpr;
 			}
-
-
-			return filter.bin_count();
+			++binno;
 		}
 
-		TTax load_tax( std::string tax_file )
+		return filter.user_bins.num_user_bins();
+	}
+
+	inline double false_positive( uint64_t bin_size_bits, uint8_t hash_functions, uint64_t n_hashes )
+	{
+		/*
+		 * calculates the theoretical false positive of a bin (bf) based on parameters
+		 */
+		return std::pow( 1 - std::exp( -hash_functions / ( bin_size_bits / static_cast< double >( n_hashes ) ) ),
+				hash_functions );
+	}
+
+	size_t load_filter( TIBF&              filter,
+			IBFConfig&         ibf_config,
+			TBinMap&           bin_map,
+			std::string const& input_filter_file,
+			TTargetFpr&        target_fpr )
+	{
+		std::ifstream              is( input_filter_file, std::ios::binary );
+		cereal::BinaryInputArchive archive( is );
+
+		std::tuple< int, int, int >                        parsed_version;
+		std::vector< std::tuple< std::string, uint64_t > > hashes_count_std;
+
+		archive( parsed_version );
+		archive( ibf_config );
+		archive( hashes_count_std );
+		archive( bin_map );
+		archive( filter );
+
+
+		// generate fpr for each bin
+		for ( auto const& [target, count] : hashes_count_std )
 		{
-			TTax          tax;
-			std::string   line;
-			std::ifstream infile;
-			infile.open( tax_file );
-			while ( std::getline( infile, line, '\n' ) )
-			{
-				std::istringstream         stream_line( line );
-				std::vector< std::string > fields;
-				std::string                field;
-				while ( std::getline( stream_line, field, '\t' ) )
-					fields.push_back( field );
-				tax[fields[0]] = Node{ fields[1], fields[2], fields[3] };
-			}
-			infile.close();
-			return tax;
+			// Use average number of hashes for each bin to calculate fp
+			uint64_t n_bins_target = std::ceil( count / static_cast< double >( ibf_config.max_hashes_bin ) );
+			// this can be off by a very small number (rounding ceil on multiple bins)
+			uint64_t n_hashes_bin = std::ceil( count / static_cast< double >( n_bins_target ) );
+
+			// false positive for the current target, considering split bins
+			target_fpr[target] =
+				1.0
+				- std::pow( 1.0 - false_positive( ibf_config.bin_size_bits, ibf_config.hash_functions, n_hashes_bin ),
+						n_bins_target );
+			;
 		}
 
-		template < typename TFilter >
-			bool load_files( std::vector< Filter< TFilter > >& filters, std::vector< FilterConfig >& fconf )
+
+		return filter.bin_count();
+	}
+
+	TTax load_tax( std::string tax_file )
+	{
+		TTax          tax;
+		std::string   line;
+		std::ifstream infile;
+		infile.open( tax_file );
+		while ( std::getline( infile, line, '\n' ) )
+		{
+			std::istringstream         stream_line( line );
+			std::vector< std::string > fields;
+			std::string                field;
+			while ( std::getline( stream_line, field, '\t' ) )
+				fields.push_back( field );
+			tax[fields[0]] = Node{ fields[1], fields[2], fields[3] };
+		}
+		infile.close();
+		return tax;
+	}
+
+	template < typename TFilter >
+		bool load_files( std::vector< Filter< TFilter > >& filters, std::vector< FilterConfig >& fconf )
+		{
+			size_t filter_cnt = 0;
+			for ( auto& filter_config : fconf )
 			{
-				size_t filter_cnt = 0;
-				for ( auto& filter_config : fconf )
+				TTax       tax;
+				IBFConfig  ibf_config;
+				TBinMap    bin_map;
+				TFilter    filter;
+				TTargetFpr target_fpr;
+				auto       bin_count = load_filter( filter, ibf_config, bin_map, filter_config.ibf_file, target_fpr );
+
+				// Parse vector with bin_map to the old map
+				TMap map;
+				for ( auto const& [binno, target] : bin_map )
 				{
-					TTax       tax;
-					IBFConfig  ibf_config;
-					TBinMap    bin_map;
-					TFilter    filter;
-					TTargetFpr target_fpr;
-					auto       bin_count = load_filter( filter, ibf_config, bin_map, filter_config.ibf_file, target_fpr );
-
-					// Parse vector with bin_map to the old map
-					TMap map;
-					for ( auto const& [binno, target] : bin_map )
-					{
-						map[target].push_back( binno );
-					}
-
-					filter_config.ibf_config = ibf_config;
-					filter_config.target_fpr = target_fpr;
-
-					if ( filter_config.tax_file != "" )
-						tax = load_tax( filter_config.tax_file );
-
-					filters.push_back(
-							Filter< TFilter >{ std::move( filter ), std::move( map ), std::move( tax ), bin_count, filter_config } );
-					filter_cnt++;
+					map[target].push_back( binno );
 				}
 
-				return true;
+				filter_config.ibf_config = ibf_config;
+				filter_config.target_fpr = target_fpr;
+
+				if ( filter_config.tax_file != "" )
+					tax = load_tax( filter_config.tax_file );
+
+				filters.push_back(
+						Filter< TFilter >{ std::move( filter ), std::move( map ), std::move( tax ), bin_count, filter_config } );
+				filter_cnt++;
 			}
 
-		void print_time( const StopClock& timeGanon, const StopClock& timeLoadFilters, const StopClock& timeClassPrint )
+			return true;
+		}
+
+	void print_time( const StopClock& timeGanon, const StopClock& timeLoadFilters, const StopClock& timeClassPrint )
+	{
+		using ::operator<<;
+		std::cerr << "ganon-classify        start time: " << StopClock_datetime( timeGanon.begin() ) << std::endl;
+		std::cerr << "loading filters      elapsed (s): " << timeLoadFilters.elapsed() << " seconds" << std::endl;
+		std::cerr << "classifying+printing elapsed (s): " << timeClassPrint.elapsed() << " seconds" << std::endl;
+		std::cerr << "ganon-classify       elapsed (s): " << timeGanon.elapsed() << " seconds" << std::endl;
+		std::cerr << "ganon-classify          end time: " << StopClock_datetime( timeGanon.end() ) << std::endl;
+		std::cerr << std::endl;
+	}
+
+	void print_stats( Stats& stats, const StopClock& timeClassPrint, auto const& parsed_hierarchy )
+	{
+		const double elapsed_classification = timeClassPrint.elapsed();
+		const double total_reads_processed  = stats.total.reads_processed > 0
+			? static_cast< double >( stats.total.reads_processed )
+			: 1; // to not report nan on divisions
+		std::cerr << "ganon-classify processed " << stats.total.reads_processed << " sequences ("
+			<< stats.total.length_processed / 1000000.0 << " Mbp) in " << elapsed_classification << " seconds ("
+			<< ( stats.total.length_processed / 1000000.0 ) / ( elapsed_classification / 60.0 ) << " Mbp/m)"
+			<< std::endl;
+		std::cerr << " - " << stats.total.reads_classified << " reads classified ("
+			<< ( stats.total.reads_classified / total_reads_processed ) * 100 << "%)" << std::endl;
+		std::cerr << "   - " << stats.total.unique_matches << " with unique matches ("
+			<< ( stats.total.unique_matches / total_reads_processed ) * 100 << "%)" << std::endl;
+		std::cerr << "   - " << stats.total.reads_classified - stats.total.unique_matches << " with multiple matches ("
+			<< ( ( stats.total.reads_classified - stats.total.unique_matches ) / total_reads_processed ) * 100 << "%)"
+			<< std::endl;
+
+		double avg_matches = stats.total.reads_classified
+			? ( stats.total.matches / static_cast< double >( stats.total.reads_classified ) )
+			: 0;
+		std::cerr << " - " << stats.total.matches << " matches (avg. " << avg_matches << " match/read classified)"
+			<< std::endl;
+		const size_t total_reads_unclassified = stats.total.reads_processed - stats.total.reads_classified;
+		std::cerr << " - " << total_reads_unclassified << " reads unclassified ("
+			<< ( total_reads_unclassified / total_reads_processed ) * 100 << "%)" << std::endl;
+
+		if ( stats.total.reads_processed < stats.input_reads )
 		{
-			using ::operator<<;
-			std::cerr << "ganon-classify        start time: " << StopClock_datetime( timeGanon.begin() ) << std::endl;
-			std::cerr << "loading filters      elapsed (s): " << timeLoadFilters.elapsed() << " seconds" << std::endl;
-			std::cerr << "classifying+printing elapsed (s): " << timeClassPrint.elapsed() << " seconds" << std::endl;
-			std::cerr << "ganon-classify       elapsed (s): " << timeGanon.elapsed() << " seconds" << std::endl;
-			std::cerr << "ganon-classify          end time: " << StopClock_datetime( timeGanon.end() ) << std::endl;
+			std::cerr << " - " << stats.input_reads - stats.total.reads_processed
+				<< " reads skipped (too long or too short (< window size))" << std::endl;
+		}
+
+		if ( parsed_hierarchy.size() > 1 )
+		{
 			std::cerr << std::endl;
-		}
-
-		void print_stats( Stats& stats, const StopClock& timeClassPrint, auto const& parsed_hierarchy )
-		{
-			const double elapsed_classification = timeClassPrint.elapsed();
-			const double total_reads_processed  = stats.total.reads_processed > 0
-				? static_cast< double >( stats.total.reads_processed )
-				: 1; // to not report nan on divisions
-			std::cerr << "ganon-classify processed " << stats.total.reads_processed << " sequences ("
-				<< stats.total.length_processed / 1000000.0 << " Mbp) in " << elapsed_classification << " seconds ("
-				<< ( stats.total.length_processed / 1000000.0 ) / ( elapsed_classification / 60.0 ) << " Mbp/m)"
-				<< std::endl;
-			std::cerr << " - " << stats.total.reads_classified << " reads classified ("
-				<< ( stats.total.reads_classified / total_reads_processed ) * 100 << "%)" << std::endl;
-			std::cerr << "   - " << stats.total.unique_matches << " with unique matches ("
-				<< ( stats.total.unique_matches / total_reads_processed ) * 100 << "%)" << std::endl;
-			std::cerr << "   - " << stats.total.reads_classified - stats.total.unique_matches << " with multiple matches ("
-				<< ( ( stats.total.reads_classified - stats.total.unique_matches ) / total_reads_processed ) * 100 << "%)"
-				<< std::endl;
-
-			double avg_matches = stats.total.reads_classified
-				? ( stats.total.matches / static_cast< double >( stats.total.reads_classified ) )
-				: 0;
-			std::cerr << " - " << stats.total.matches << " matches (avg. " << avg_matches << " match/read classified)"
-				<< std::endl;
-			const size_t total_reads_unclassified = stats.total.reads_processed - stats.total.reads_classified;
-			std::cerr << " - " << total_reads_unclassified << " reads unclassified ("
-				<< ( total_reads_unclassified / total_reads_processed ) * 100 << "%)" << std::endl;
-
-			if ( stats.total.reads_processed < stats.input_reads )
+			std::cerr << "By database hierarchy:" << std::endl;
+			for ( auto const& h : parsed_hierarchy )
 			{
-				std::cerr << " - " << stats.input_reads - stats.total.reads_processed
-					<< " reads skipped (too long or too short (< window size))" << std::endl;
+				std::string hierarchy_label = h.first;
+				avg_matches                 = stats.hierarchy_total[hierarchy_label].reads_classified
+					? ( stats.hierarchy_total[hierarchy_label].matches
+							/ static_cast< double >( stats.hierarchy_total[hierarchy_label].reads_classified ) )
+					: 0;
+				std::cerr << " - " << hierarchy_label << ": " << stats.hierarchy_total[hierarchy_label].reads_classified
+					<< " classified ("
+					<< ( stats.hierarchy_total[hierarchy_label].reads_classified / total_reads_processed ) * 100
+					<< "%) " << stats.hierarchy_total[hierarchy_label].unique_matches << " unique ("
+					<< ( stats.hierarchy_total[hierarchy_label].unique_matches / total_reads_processed ) * 100
+					<< "%) "
+					<< stats.hierarchy_total[hierarchy_label].reads_classified
+					- stats.hierarchy_total[hierarchy_label].unique_matches
+					<< " multiple ("
+					<< ( ( stats.hierarchy_total[hierarchy_label].reads_classified
+								- stats.hierarchy_total[hierarchy_label].unique_matches )
+							/ total_reads_processed )
+					* 100
+					<< "%) " << stats.hierarchy_total[hierarchy_label].matches << " matches (avg. " << avg_matches
+					<< ")" << std::endl;
 			}
+		}
+	}
 
-			if ( parsed_hierarchy.size() > 1 )
+	void parse_reads( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config )
+	{
+		for ( auto const& reads_file : config.single_reads )
+		{
+			try
 			{
-				std::cerr << std::endl;
-				std::cerr << "By database hierarchy:" << std::endl;
-				for ( auto const& h : parsed_hierarchy )
+				seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > >
+					fin1{ reads_file };
+				for ( auto&& rec : fin1 | seqan3::views::chunk( config.n_reads ) )
 				{
-					std::string hierarchy_label = h.first;
-					avg_matches                 = stats.hierarchy_total[hierarchy_label].reads_classified
-						? ( stats.hierarchy_total[hierarchy_label].matches
-								/ static_cast< double >( stats.hierarchy_total[hierarchy_label].reads_classified ) )
-						: 0;
-					std::cerr << " - " << hierarchy_label << ": " << stats.hierarchy_total[hierarchy_label].reads_classified
-						<< " classified ("
-						<< ( stats.hierarchy_total[hierarchy_label].reads_classified / total_reads_processed ) * 100
-						<< "%) " << stats.hierarchy_total[hierarchy_label].unique_matches << " unique ("
-						<< ( stats.hierarchy_total[hierarchy_label].unique_matches / total_reads_processed ) * 100
-						<< "%) "
-						<< stats.hierarchy_total[hierarchy_label].reads_classified
-						- stats.hierarchy_total[hierarchy_label].unique_matches
-						<< " multiple ("
-						<< ( ( stats.hierarchy_total[hierarchy_label].reads_classified
-									- stats.hierarchy_total[hierarchy_label].unique_matches )
-								/ total_reads_processed )
-						* 100
-						<< "%) " << stats.hierarchy_total[hierarchy_label].matches << " matches (avg. " << avg_matches
-						<< ")" << std::endl;
+					ReadBatches rb{ false };
+					for ( auto& [id, seq] : rec )
+					{
+						rb.ids.push_back( std::move( id ) );
+						rb.seqs.push_back( std::move( seq ) );
+					}
+					stats.input_reads += rb.ids.size();
+					queue1.push( std::move( rb ) );
 				}
 			}
+			catch ( seqan3::parse_error const& e )
+			{
+				std::cerr << "Error parsing file [" << reads_file << "]. " << e.what() << std::endl;
+				continue;
+			}
 		}
-
-		void parse_reads( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config )
+		if ( config.paired_reads.size() > 0 )
 		{
-			for ( auto const& reads_file : config.single_reads )
+			for ( size_t pair_cnt = 0; pair_cnt < config.paired_reads.size(); pair_cnt += 2 )
 			{
 				try
 				{
-					seqan3::sequence_file_input< raptor::dna4_traits, seqan3::fields< seqan3::field::id, seqan3::field::seq > >
-						fin1{ reads_file };
+					seqan3::sequence_file_input< raptor::dna4_traits,
+						seqan3::fields< seqan3::field::id, seqan3::field::seq > >
+							fin1{ config.paired_reads[pair_cnt] };
+					seqan3::sequence_file_input< raptor::dna4_traits,
+						seqan3::fields< seqan3::field::id, seqan3::field::seq > >
+							fin2{ config.paired_reads[pair_cnt + 1] };
 					for ( auto&& rec : fin1 | seqan3::views::chunk( config.n_reads ) )
 					{
-						ReadBatches rb{ false };
+						ReadBatches rb{ true };
 						for ( auto& [id, seq] : rec )
 						{
 							rb.ids.push_back( std::move( id ) );
 							rb.seqs.push_back( std::move( seq ) );
 						}
+						// loop in the second file and get same amount of reads
+						for ( auto& [id, seq] : fin2 | std::views::take( config.n_reads ) )
+						{
+							rb.seqs2.push_back( std::move( seq ) );
+						}
 						stats.input_reads += rb.ids.size();
 						queue1.push( std::move( rb ) );
 					}
 				}
-				catch ( seqan3::parse_error const& e )
+				catch ( seqan3::parse_error const& ext )
 				{
-					std::cerr << "Error parsing file [" << reads_file << "]. " << e.what() << std::endl;
+					std::cerr << "Error parsing files [" << config.paired_reads[pair_cnt] << "/"
+						<< config.paired_reads[pair_cnt + 1] << "]. " << ext.what() << std::endl;
 					continue;
 				}
 			}
-			if ( config.paired_reads.size() > 0 )
-			{
-				for ( size_t pair_cnt = 0; pair_cnt < config.paired_reads.size(); pair_cnt += 2 )
-				{
-					try
-					{
-						seqan3::sequence_file_input< raptor::dna4_traits,
-							seqan3::fields< seqan3::field::id, seqan3::field::seq > >
-								fin1{ config.paired_reads[pair_cnt] };
-						seqan3::sequence_file_input< raptor::dna4_traits,
-							seqan3::fields< seqan3::field::id, seqan3::field::seq > >
-								fin2{ config.paired_reads[pair_cnt + 1] };
-						for ( auto&& rec : fin1 | seqan3::views::chunk( config.n_reads ) )
-						{
-							ReadBatches rb{ true };
-							for ( auto& [id, seq] : rec )
-							{
-								rb.ids.push_back( std::move( id ) );
-								rb.seqs.push_back( std::move( seq ) );
-							}
-							// loop in the second file and get same amount of reads
-							for ( auto& [id, seq] : fin2 | std::views::take( config.n_reads ) )
-							{
-								rb.seqs2.push_back( std::move( seq ) );
-							}
-							stats.input_reads += rb.ids.size();
-							queue1.push( std::move( rb ) );
-						}
-					}
-					catch ( seqan3::parse_error const& ext )
-					{
-						std::cerr << "Error parsing files [" << config.paired_reads[pair_cnt] << "/"
-							<< config.paired_reads[pair_cnt + 1] << "]. " << ext.what() << std::endl;
-						continue;
-					}
-				}
-			}
-			queue1.notify_push_over();
 		}
+		queue1.notify_push_over();
+	}
 
-		void write_classified( SafeQueue< ReadOut >& classified_queue, std::ofstream& out )
+	void write_classified( SafeQueue< ReadOut >& classified_queue, std::ofstream& out )
+	{
+		while ( true )
 		{
-			while ( true )
+			ReadOut ro = classified_queue.pop();
+			if ( ro.readID != "" )
 			{
-				ReadOut ro = classified_queue.pop();
-				if ( ro.readID != "" )
+				for ( size_t i = 0; i < ro.matches.size(); ++i )
 				{
-					for ( size_t i = 0; i < ro.matches.size(); ++i )
-					{
-						out << ro.readID << '\t' << ro.matches[i].target << '\t' << ro.matches[i].kmer_count << '\n';
-					}
-				}
-				else
-				{
-					break;
+					out << ro.readID << '\t' << ro.matches[i].target << '\t' << ro.matches[i].kmer_count << '\n';
 				}
 			}
+			else
+			{
+				break;
+			}
 		}
+	}
 
-		void write_unclassified( SafeQueue< ReadOut >& unclassified_queue, std::string out_unclassified_file )
+	void write_unclassified( SafeQueue< ReadOut >& unclassified_queue, std::string out_unclassified_file )
+	{
+		std::ofstream out_unclassified( out_unclassified_file );
+		while ( true )
 		{
-			std::ofstream out_unclassified( out_unclassified_file );
-			while ( true )
+			ReadOut rou = unclassified_queue.pop();
+			if ( rou.readID != "" )
 			{
-				ReadOut rou = unclassified_queue.pop();
-				if ( rou.readID != "" )
-				{
-					out_unclassified << rou.readID << '\n';
-				}
-				else
-				{
-					out_unclassified.close();
-					break;
-				}
+				out_unclassified << rou.readID << '\n';
+			}
+			else
+			{
+				out_unclassified.close();
+				break;
 			}
 		}
+	}
 
-		template < typename TFilter >
-			TTax merge_tax( std::vector< Filter< TFilter > > const& filters )
-			{
-				if ( filters.size() == 1 )
-				{
-					return filters[0].tax;
-				}
-				else
-				{
-					TTax merged_tax = filters[0].tax;
-					for ( size_t i = 1; i < filters.size(); ++i )
-					{
-						// merge taxonomies keeping the first one as a default
-						merged_tax.insert( filters[i].tax.begin(), filters[i].tax.end() );
-					}
-					return merged_tax;
-				}
-			}
-
-		template < typename TFilter >
-			void validate_targets_tax( std::vector< Filter< TFilter > > const& filters,
-					TTax&                                   tax,
-					bool                                    quiet,
-					const std::string                       tax_root_node )
-			{
-				for ( auto const& filter : filters )
-				{
-					for ( auto const& [target, bins] : filter.map )
-					{
-						if ( tax.count( target ) == 0 )
-						{
-							tax[target] = Node{ tax_root_node, "no rank", target };
-							if ( !quiet )
-								std::cerr << "WARNING: target [" << target << "] without tax entry, setting parent as root node ["
-									<< tax_root_node << "]" << std::endl;
-						}
-					}
-				}
-			}
-
-		void pre_process_lca( LCA& lca, TTax& tax, std::string tax_root_node )
+	template < typename TFilter >
+		TTax merge_tax( std::vector< Filter< TFilter > > const& filters )
 		{
-			for ( auto const& [target, node] : tax )
+			if ( filters.size() == 1 )
 			{
-				lca.addEdge( node.parent, target );
+				return filters[0].tax;
 			}
-			lca.doEulerWalk( tax_root_node );
+			else
+			{
+				TTax merged_tax = filters[0].tax;
+				for ( size_t i = 1; i < filters.size(); ++i )
+				{
+					// merge taxonomies keeping the first one as a default
+					merged_tax.insert( filters[i].tax.begin(), filters[i].tax.end() );
+				}
+				return merged_tax;
+			}
 		}
+
+	template < typename TFilter >
+		void validate_targets_tax( std::vector< Filter< TFilter > > const& filters,
+				TTax&                                   tax,
+				bool                                    quiet,
+				const std::string                       tax_root_node )
+		{
+			for ( auto const& filter : filters )
+			{
+				for ( auto const& [target, bins] : filter.map )
+				{
+					if ( tax.count( target ) == 0 )
+					{
+						tax[target] = Node{ tax_root_node, "no rank", target };
+						if ( !quiet )
+							std::cerr << "WARNING: target [" << target << "] without tax entry, setting parent as root node ["
+								<< tax_root_node << "]" << std::endl;
+					}
+				}
+			}
+		}
+
+	void pre_process_lca( LCA& lca, TTax& tax, std::string tax_root_node )
+	{
+		for ( auto const& [target, node] : tax )
+		{
+			lca.addEdge( node.parent, target );
+		}
+		lca.doEulerWalk( tax_root_node );
+	}
 
 	} // namespace detail
 
 	template < typename TFilter >
-		bool ganon_classify( Config config, int rank, int numeroProcesos )
+		bool ganon_classify( Config config , int rank, int numeroProcesos)
 		{
 			// Start time count
 			StopClock timeGanon;
@@ -1191,15 +1769,12 @@ namespace GanonClassify
 
 			auto parsed_hierarchy = detail::parse_hierarchy( config );
 
-			if ( config.verbose && rank == 0 ) //que solo la imprima el rank 0, no todos
+			if ( config.verbose && rank == 0)
 				detail::print_hierarchy( config, parsed_hierarchy );
 
 			// Initialize variables
 			StopClock timeLoadFilters;
 			StopClock timeClassPrint;
-
-			//solo el proceso 0 va a escribir el reporte final solo el debe abrirlo
-
 
 			detail::Stats stats;
 			std::ofstream out_rep; // Set default output stream (file or stdout)
@@ -1220,23 +1795,98 @@ namespace GanonClassify
 				}
 			}
 
+			// calcular rangos de lectura 
+			uint64_t start_read1 = 0;
+			uint64_t end_read1 = 0;
 
-			//Va a ser el proceso 0 el que lea las lecturas y las reparta a todos los demas procesos inlcuyendose a si mismo para clasificiarlas
+			uint64_t start_read2 = 0;
+			uint64_t end_read2 = 0;
+
+			bool interleaved = false;
+
+			bool two_files = false; 
+
+			// comprobamos si son paired reads y 2 archivos, si es paired reads pero un archivo (interleaved) o si es single reads. 
+			if ( config.paired_reads.size() == 2 ){
+				two_files = true;
+				try{
+					//calcular chunks pa el archivo 1 y 2 , los calculo a parte aunque deberian ser iguales ya que tienen q tener mismas lecturas y mismos numero de bytes si no fallara ya que no seria posible de una manera correcta, rapida (eficinte) y simple sincronizar cada archivo en cada rank 
+					uint64_t file_size1 = std::filesystem::file_size(config.paired_reads[0]);
+					uint64_t file_size2 = std::filesystem::file_size(config.paired_reads[1]);
+					if (file_size1 != file_size2){
+						std::cerr << "Error: paired read files have different sizes, cannot be processed in parallel" << std::endl;
+						return false;
+					}
+					uint64_t chunk_size = file_size1 / numeroProcesos; //cuanto le va a tocar a cada proceso 
+											  //caculo el resto 
+											  //uint64_t resto = file_size % numeroProcesos;
+											  // no hace falta calcularlo, el ultimo proceso se queda con el resto y listo, poca diferencia va a haber en la practica y evito andar con un bucle para añadirle unos bytes a los primeros x procesos 
+					start_read1 = rank * chunk_size;
+					end_read1 = (rank == numeroProcesos -1) ? file_size1 : (rank+1) * chunk_size; // el ultimo proceso se queda con el resto 
+					start_read2 = rank * chunk_size;
+					end_read2 = (rank == numeroProcesos -1) ? file_size2 : (rank+1) * chunk_size; // el ultimo proceso se queda con el resto 
+
+				} catch ( const std::exception& e ){
+					std::cerr << "Error getting file size: " << e.what() << std::endl;
+					return false;
+				}
+			}else if ( config.paired_reads.size() == 1 ) {
+				//interleaved 
+				interleaved = true;
+				try{
+					uint64_t file_size = std::filesystem::file_size(config.paired_reads[0]);
+					uint64_t chunk_size = file_size / numeroProcesos; //cuanto le va a tocar a cada proceso 
+											  //caculo el resto 
+											  //uint64_t resto = file_size % numeroProcesos;
+											  // no hace falta calcularlo, el ultimo proceso se queda con el resto y listo, poca diferencia va a haber en la practica y evito andar con un bucle para añadirle unos bytes a los primeros x procesos 
+					start_read1 = rank * chunk_size;
+					end_read1 = (rank == numeroProcesos -1) ? file_size : (rank+1) * chunk_size; // el ultimo proceso se queda con el resto 
+				} catch ( const std::exception& e ){
+					std::cerr << "Error getting file size: " << e.what() << std::endl;
+					return false;	
+				}
+			}
+			//si es single reads 
+			if (!two_files && !config.single_reads.empty()){
+				try{
+					uint64_t file_size = std::filesystem::file_size(config.single_reads[0]);
+					uint64_t chunk_size = file_size / numeroProcesos; //cuanto le va a tocar a cada proceso 
+											  //caculo el resto 
+											  //uint64_t resto = file_size % numeroProcesos;
+											  // no hace falta calcularlo, el ultimo proceso se queda con el resto y listo, poca diferencia va a haber en la practica y evito andar con un bucle para añadirle unos bytes a los primeros x procesos 
+					start_read1 = rank * chunk_size; 
+					end_read1 = (rank == numeroProcesos -1) ? file_size : (rank+1) * chunk_size; // el ultimo proceso se queda con el resto
+				} catch ( const std::exception& e ){
+					std::cerr << "Error getting file size: " << e.what() << std::endl;
+					return false;
+				}
+			}
+
+			/*
+			if ( !config.single_reads.empty() ){
+				std::string filename = config.single_reads[0];
+				try{
+					uint64_t file_size = std::filesystem::file_size(filename);
+					uint64_t chunk_size = file_size / numeroProcesos; //cuanto le va a tocar a cada proceso 
+											  //caculo el resto 
+											  //uint64_t resto = file_size % numeroProcesos;
+											  // no hace falta calcularlo, el ultimo proceso se queda con el resto y listo, poca diferencia va a haber en la practica y evito andar con un bucle para añadirle unos bytes a los primeros x procesos 
+					start_read1 = rank * chunk_size; 
+					end_read1 = (rank == numeroProcesos -1) ? file_size : (rank+1) * chunk_size; // el ultimo proceso se queda con el resto
+				} catch ( const std::exception& e ){
+					std::cerr << "Error getting file size: " << e.what() << std::endl;
+					return false;
+				}
+			}*/
 
 			// Queues for internal read handling
 			// queue1 get reads from file
 			// queue2 will get unclassified reads if hierachy == 2
 			// if hierachy == 3 queue1 is used for unclassified and so on
 			// config.n_batches*config.n_reads = max. amount of reads in memory
-
-			// cola local para el rank 0 
-			SafeQueue< detail::ReadBatches > queue_local( config.n_batches ); //cola local para el proceso 0 donde almacenara las lecturas que le tocan a el para clasificar
-
 			SafeQueue< detail::ReadBatches >  queue1( config.n_batches );
 			SafeQueue< detail::ReadBatches >  queue2;
-			//SafeQueue< detail::ReadBatches >* pointer_current = &queue1; // pointer to the queues
-			//el puntero a la cola dependera del rank 
-			SafeQueue< detail::ReadBatches >* pointer_current = ( rank == 0) ? &queue_local : &queue1; // pointer to the queues, el proceso 0 usara la cola local y los demas procesos usaran la cola 1 para recibir las lecturas del proceso 0
+			SafeQueue< detail::ReadBatches >* pointer_current = &queue1; // pointer to the queues
 			SafeQueue< detail::ReadBatches >* pointer_helper  = &queue2; // pointer to the queues
 			SafeQueue< detail::ReadBatches >* pointer_extra;             // pointer to the queues
 
@@ -1244,233 +1894,30 @@ namespace GanonClassify
 			seqan3::contrib::bgzf_thread_count = 1u;
 
 			/*
+			// mirar si es paired o no  
+			if ( !config.paired_reads.empty() ){
+				//es un solo archivo inteleaved, lo meto en single reads pero interleaved a true 
+				config.single_reads.push_back(config.paired_reads[0]);
+				config.paired_reads.clear();
+				interleaved = true;
+			}*/
+
+			// debug para saber q ha llegado
+			std::cerr << "[RANK " << rank << "] Empezando a leer archivo)..." << std::endl;			
+
 			// Thread for reading input files
 			std::future< void > read_task = std::async(
-			std::launch::async, detail::parse_reads, std::ref( queue1 ), std::ref( stats ), std::ref( config ) );
-
-*/
-			std::future<void> read_task; //tarea asincrona para leer las lecturas, solo el proceso 0 la va a ejecutar
-			std::future<void> distribute_task; //tarea asincrona para distribuir las lecturas, solo la ejecuta el proceso 0, para que no haya deadlock con el hilo principal si hay muchas lecturas 
-
-			//el proceso 0 va a leer los archivos de entrada
-			if ( rank == 0 )
-			{
-				//detail::parse_reads( queue1, stats, config );
-				//lanzar la tarea asincrona para leer las lecturas en un hilo separado y paralelo para evitar que el proceso 0 se quede esperando a que se lean todas las lecturas y evitar un deadlock por si no hay suficiente memoria nunca se vaciaria la cola (queue1) y los demas procesos se quedarian esperando a que el proceso 0 les envie las lecturas pero este no las enviaria al no haber leido todas las lecturas (insuficiente memoria) y al no enviarlas nunca vaciaria la cola (queue1)
-				read_task = std::async(
-						std::launch::async, detail::parse_reads, std::ref( queue1 ), std::ref( stats ), std::ref( config ) );
-			}
-
-			//para repartir las lecturas a los demas procesos usarios Send y Rec pero estas funciones no valen para pasar estructuras de datos complejas que puedan tener punteros
-			//a direcciones de memoria donde la memoria no esta compartida entre los diferentes procesos y solo pasarias el puntero y no la info que contiene. 
-			//La solucion es usar las funciones de OpenMPI; MPI_Pack y MPI_Unpack que empaquetan y desempaquetan los datos en un buffer de memoria compartida entre todos los procesos,
-			//usare dos funciones auxialiares que son pack_readbatch y unpack_readbatch que empaquetan y desempaquetan los datos de ReadBatches.
-			//
-
-			//el proceso 0 es el que empaqueta y envia las lecturas a los demas procesos 
-
-			if ( rank == 0 )
-			{
-				//la explicacion del tamano para el bufferSize viene explicado de que, seqan3:dna4 para expresar las bases del ADN (A,C, G, T) usa 2 bits por base, 
-				//(https://docs.seqan.de/seqan3/3.0.1/classseqan3_1_1dna4.html)
-				//entonces, en 1 byte ( 8 bits ) me caben 4 bases. Entonces el vector de seqan3:dna4 , cada base son 2 bits, el tamano de lote se configura en n_reads que por defecto son 400
-				//el tamano por defecto de 400 del n_reads viene en la linea 45 de (desde ganon_classify) en /include/ganon_classify/Config.hpp [ linea 45 ]
-				// No sabemos cuantas bases va a tener cada lectura, pero si sabemos que el tamano de lote es de 400 lecturas,
-				//Los IDS son std::string , No sabemos cuanto va a ser la cabecera de promedio por ID, 400 x X  bytes, 
-				//si es el proceso 0 , empaquetamos las lecturas y las enviamos
-				//Si se establece un tamano de buffer arbitrario puede pasar que en una lectura determinada, el buffer no llegue, aunque esto no ocurriera, estariamos desperdiciando memoria.
-				// La solucion es usar un buffer de tamano variable, que se ajuste al numero de lecturas y a la longitud de las lecturas.
-
-				//PENSAR EN LO DEL TAMANO DEL BUFFER; DE MOMENTO QUEDA CON UN BUFFERSIZE DE 1 MB (deberia llegar)
-
-			distribute_task = std::async( std::launch::async, [&queue1, &queue_local, numeroProcesos, rank](){
-				int proceso = 0; //variable para controlar a que proceso se envian las lecturas
-				//en vez de queue1.empty a veces si el lector aun no metio nada en la cola, salta la condiion y acaba inmediatamente el bucle, para ello lo he cambiado a while true y dentro que rompa con una condicion si ya no hay ninguna lectura mas, uso queue.pop que tiene en cuenta si el lector ha terminado o no
-				while ( true )
-				{
-					//sacamos un lote de lecturas de la cola 
-					detail::ReadBatches rb = queue1.pop();
-					//si el lote de lecturas esta vacio (seqs, seqs2 e ids) es que el lector ha terminado
-					if ( rb.ids.empty() && rb.seqs.empty() && rb.seqs2.empty() )
-					{
-						break;
-					}
-
-					// si el proceso destino es el proceso 0 no hay que enviar lecturas que se las queda el rank 0 oara clasificiarlas
-					if ( proceso == 0 ){
-						//el proceso 0 se queda con la lectura para clasificarla, la mete en su cola local y no la envian por tanto
-						queue_local.push( std::move( rb ) ); 
-					}
-					else {
-						//toca empaquetar 
-						int pack_size = 0; //variable para controlar el tamano del buffer empaquetado 
-						int temp_size; //variable auxiliar temporal para MPI PackSize 
-
-						//si es paired (es un int)
-						MPI_Pack_size( 1, MPI_INT, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el int de paired
-						pack_size += temp_size;
-						//numero de reads (es un int )
-						MPI_Pack_size( 1, MPI_INT, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el int de numero de reads
-						pack_size += temp_size;
-						//ids (vector de strings)
-						for (const auto& id : rb.ids){
-							int id_size = id.size();
-							MPI_Pack_size( 1, MPI_INT, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el int de tamano de id
-							pack_size += temp_size;
-							MPI_Pack_size( id_size, MPI_CHAR, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el string del id
-							pack_size += temp_size;
-						}
-						//seqs (Read1) (vector de seqan3:dna4)
-						for (const auto& seq : rb.seqs){
-							int seq_size = seq.size();
-							MPI_Pack_size( 1, MPI_INT, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el int de tamano de seq
-							pack_size += temp_size;
-							MPI_Pack_size( seq_size, MPI_CHAR, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el vector de seqan3:dna4
-							pack_size += temp_size;
-						}
-						//si es paired, seqs2 (Read2) (vector de seqan3:dna4)
-						if ( rb.paired ){
-							for (const auto& seq2 : rb.seqs2){
-								int seq2_size = seq2.size();
-								MPI_Pack_size( 1, MPI_INT, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el int de tamano de seq2
-								pack_size += temp_size;
-								MPI_Pack_size( seq2_size, MPI_CHAR, MPI_COMM_WORLD, &temp_size ); //tamano necesario para empaquetar el vector de seqan3:dna4_traits
-								pack_size += temp_size;
-							}
-						}
-
-						//creo un buffer dinmaico y empaqueto 
-
-						std::vector<char> dynamic_buffer(pack_size); // buffer dinamico con el tamano necesario
-						int pos = 0;
-						pack_readbatch( rb, dynamic_buffer.data(), pack_size, pos, MPI_COMM_WORLD ); // empaquetamos el lote de lecturas en el buffer 
-
-						//enviamos el buffer al proceso que toque en esta iteraccion del bucle solo si hay mas de un proceso claro 
-						if ( numeroProcesos > 1 ){
-							MPI_Send( &pos, 1, MPI_INT, proceso, 0, MPI_COMM_WORLD ); // enviamos pos para que receptor sepa cuantos bytes tiene que leer 
-							MPI_Send( dynamic_buffer.data(), pos, MPI_PACKED, proceso, 0, MPI_COMM_WORLD ); // enviamos el buffer empaquetado al proceso que toque (pack_size bytes)
-						}														  //incrementamos el proceso al que enviamos las lecturas con round robin 
-					}
-
-					proceso++; //incrementamos el proceso al que enviamos las lecturas
-					if ( proceso >= numeroProcesos ) proceso = 0; //si el proceso es mayor o igual al numero de procesos, volvemos al proceso 0 (round robin)
-				}
-				//queue2 es una cola pa almacenar las lecturas no clasificadas si hay mas de una jerarquia, se gestiona en cada memoria local de cada proceso
-				/*
-				//si hay paired reads en queue2
-				int proceso = 1; //empezamos a enviar al proceso 1
-				while ( !queue2.empty() )
-				{
-				//sacamos un lote de lecturas de la cola 
-				detail::ReadBatches rb = queue2.pop();
-				//si el lote de lecturas esta vacio (seqs, seqs2 e ids) hacemos continue para sacar otro lote de lecturas en la siguiente iteracion del bucle
-				if ( rb.ids.empty() && rb.seqs.empty() && rb.seqs2.empty() )
-				{
-				continue;
-				}
-
-				//toca empaquetar 
-				int pos = 0;
-				pack_readbatch( rb, buffer, BUFFERSIZE, pos, MPI_COMM_WORLD ); // empaquetamos el lote de lecturas en el buffer 
-											       //enviamos el buffer al proceso que toque en esta iteraccion del bucle 
-											       MPI_Send( &pos, 1, MPI_INT, proceso, 1, MPI_COMM_WORLD ); // enviamos pos para que receptor sepa cuantos bytes tiene que leer , le pongo 1 (etiqueta distintia al queue1)
-											       MPI_Send( buffer, pos, MPI_PACKED, proceso, 1, MPI_COMM_WORLD ); // enviamos el buffer empaquetado al proceso que toque (pos bytes)
-																				//incrementamos el proceso al que enviamos las lecturas con round robin 
-																				proceso = (proceso % (numeroProcesos - 1)) + 1; // el proceso 0 no envia lecturas a si mismo, empieza a enviar al proceso 1 y luego al 2, etc. ( del 1 al numeroProcesos -1 y una vez llega pues otra vez al 1 y asi)
-																				}*/
-				// Enviar senal a todos los demas procesos para indicar que no hay mas lecturas
-				//
-				//senal fin lectura queue1 
-				int fin = -1; //-1 indicara que no hay mas lecturas 
-				for ( int i = 1; i < numeroProcesos; ++i )
-				{
-					MPI_Send( &fin, 1, MPI_INT, i, 0, MPI_COMM_WORLD ); // enviamos fin de lectura queue1
-				}
-				/*
-				//senal fin lectura queue2
-				for ( int i = 1; i < numeroProcesos; ++i )
-				{
-				MPI_Send( &fin, 1, MPI_INT, i, 1, MPI_COMM_WORLD ); // enviamos fin de lectura queue2 (la etiqueta pa queue1 era 0 y para queue2 es 1)
-				}*/
-				//esperar a que el hilo de lectura termine 
-				//read_task.get();
-				//notificar a la cola local del proceso 0 que no hay mas lecturas para clasificarlas
-				queue_local.notify_push_over(); 
-			});} //fin del hilo paralelo de distribucion de lecturas 
-
-
-			//declarar receive task 
-			std::future< void > receive_task;
-
-			// toca recibir las lecturas de los demas procesos para proceder a clasificarlas 
-			if ( rank != 0 )
-			{
-				//al recibir no vamos a recibir y procesar si no que vamos a recibir y guardar en una cola ya que si no bloquearia a MPI_REcv
-				//recibir lecturas de queue1 
-				//lanzar la recepcion de lecturas en un hilo paralelo, asi el proceso puede empezar a clasificar lecturas mientras sigue recibiendo mas lecturas 
-				receive_task = std::async( std::launch::async, [&queue1]() {
-
-						while ( true ){
-						int pos;
-						MPI_Recv( &pos, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE ); // recibimos el numero de bytes que tenemos que leer 
-						if ( pos == -1 ) // si pos es -1, significa que no hay mas lecturas
-						{
-						break; // salimos del bucle
-						}
-						//buffer dinamico para recibir
-						std::vector<char> buffer(pos); // creamos un buffer de tamano pos que sera donde recibimos los datos 
-						MPI_Recv( buffer.data(), pos, MPI_PACKED, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE ); // recibimos el buffer empaquetado 
-						int offset = 0; // desempaquetamos el buffer en un ReadBatches 
-						detail::ReadBatches rb;
-						unpack_readbatch( rb, buffer.data(), pos, offset, MPI_COMM_WORLD ); // desempaquetamos el buffer en un ReadBatches
-														    //metemos el ReadBatches en la cola de lectura si no esta vacio 
-						if ( !rb.ids.empty() || !rb.seqs.empty() || !rb.seqs2.empty() ) // si el ReadBatches no esta vacio
-						{
-						queue1.push( std::move( rb ) ); // metemos el ReadBatches en la cola de lectura 
-						}
-						}
-						/*
-						//recibir lecturas de queue2 ( si es que hay paired reads ) 
-						while ( true )
-						{
-						int pos;
-						MPI_Recv( &pos, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE ); // recibimos el numero de bytes que tenemos que leer 
-						if ( pos == -1 ) // si pos es -1, significa que no hay mas lecturas
-						{
-						break; // salimos del bucle
-						}
-						char buffer[pos]; // creamos un buffer de tamano pos que sera donde recibimos los datos 
-						MPI_Recv( buffer, pos, MPI_PACKED, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE ); // recibimos el buffer empaquetado 
-						int offset = 0; // desempaquetamos el buffer en un ReadBatches 
-						detail::ReadBatches rb;
-						unpack_readbatch( rb, buffer, pos, offset, MPI_COMM_WORLD ); // desempaquetamos el buffer en un ReadBatches
-													     //metemos el ReadBatches en la cola de lectura si no esta vacio 
-													     if ( !rb.ids.empty() || !rb.seqs.empty() || !rb.seqs2.empty() ) // si el ReadBatches no esta vacio
-													     {
-													     pointer_current->push( std::move( rb ) ); // metemos el ReadBatches en la cola de lectura 
-													     }
-													     }*/ 
-						//notificar que no hay mas lecturas 
-						queue1.notify_push_over();
-				}); //fin del hilo paralelo de recepcion de lecturas
-			}
-
-
+					std::launch::async, detail::parse_reads_parallel, std::ref( queue1 ), std::ref( stats ), std::ref( config ), start_read1, end_read1, start_read2, end_read2, rank, interleaved, two_files ); //lanzar hilo de lecturas en paralelo
 
 			// Thread for printing unclassified reads
 			SafeQueue< detail::ReadOut > unclassified_queue;
 			std::future< void >          write_unclassified_task;
-			//cada rank que escriba en su propio archivo de unclassified
-			std::string out_unclassified_file = config.output_prefix + ".unc.rank";
-			//si el rank no es el 0 (que escribe en el .unc) le añado el numero de rank al nombre del archivo de unclassified 
-			if (rank > 0)
-				out_unclassified_file += ".rank" + std::to_string(rank);
 			if ( config.output_unclassified && !config.output_prefix.empty() )
 			{
 				write_unclassified_task = std::async( std::launch::async,
 						detail::write_unclassified,
 						std::ref( unclassified_queue ),
-						out_unclassified_file );
+						config.output_prefix + ".unc" );
 			}
 
 
@@ -1560,14 +2007,14 @@ namespace GanonClassify
 
 				if ( !config.output_prefix.empty() )
 				{
-					// nombre de archivo de salida distinto para cada rank  
+					// nombres de ficihero de salida con el rank del procesos
 					std::string hierarchy_output_file_lca = hierarchy_config.output_file_lca;
-					std::string hierarchy_output_file_all = hierarchy_config.output_file_all;	
-					if (rank > 0){
-						if( hierarchy_config.output_file_lca.empty() == false ){
+					std::string hierarchy_output_file_all = hierarchy_config.output_file_all;
+					if ( rank > 0 ){
+						if ( hierarchy_config.output_file_lca.empty() == false){
 							hierarchy_output_file_lca += ".rank" + std::to_string(rank);
 						}
-						if( hierarchy_config.output_file_all.empty() == false ){
+						if ( hierarchy_config.output_file_all.empty() == false){
 							hierarchy_output_file_all += ".rank" + std::to_string(rank);
 						}
 					}
@@ -1606,6 +2053,9 @@ namespace GanonClassify
 				std::vector< std::future< void > > tasks;
 				// Threads for classification
 				timeClassPrint.start();
+
+				std::cerr << "[RANK " << rank << "] Empezando a lanzar a los hilos clasificadores (tasks)..." << std::endl;
+
 				for ( size_t taskNo = 0; taskNo < config.threads; ++taskNo )
 				{
 
@@ -1623,167 +2073,243 @@ namespace GanonClassify
 								pointer_helper,
 								hierarchy_config,
 								hierarchy_first,
-								hierarchy_last ) );
+								hierarchy_last ));
 				}
 
 				// Wait here until classification is over
+				//
+
+				std::cerr << "[RANK " << rank << "] Empezando a esperar a los workers (tasks)..." << std::endl;
+
 				for ( auto&& task : tasks )
 				{
 					task.get();
 				}
 
+				std::cerr << "[RANK " << rank << "] Fin de  esperar a los workers (tasks)..." << std::endl;
+
 				// After classification, no more reads are going to be pushed to the output
 				classified_all_queue.notify_push_over();
 				classified_lca_queue.notify_push_over();
 
-				// Sum reports of each threads into one
-				detail::TRep rep = sum_reports( reports );
 
-				//el mapa rep contiene las bacterias que han hecho match
+
+				// Sum reports of each threads into one
+				detail::TRep rep = sum_reports( reports ); //cada thread tiene su propio reporte, juntarolo todo
 
 				// Sum totals for each thread and report into stats
 				stats.add_totals( hierarchy_label, totals );
-				stats.add_reports( hierarchy_label, rep );
+				//stats.add_reports( hierarchy_label, rep ); los reportes pa el final 
 
-				//esperar por el hilo de distribucion, lectura y recibo 
-				if ( rank == 0 && hierarchy_first ){
-					if ( read_task.valid() ) read_task.get();
-					if ( distribute_task.valid() ) distribute_task.get();
-				}
-				if ( rank != 0 && hierarchy_first ){
-					if ( receive_task.valid() ) receive_task.get();
-					//esperar a que el hilo de recepcion de lecturas termine para asegurarnos que ya no quedan mas lecturas por recibir antes de proceder a clasificar las lecturas recibidas y evitar un posible deadlock
-				}
-
-				//una vez estan todos los reports y stats, las mandamos al rank 0 para que tenga un report y stats global.
+				//mandar al rank 0 los resultados 
 				size_t local_classified = stats.total.reads_classified;
-				size_t local_unique = stats.total.unique_matches;
 				size_t local_matches = stats.total.matches;
+				size_t local_unique = stats.total.unique_matches;
 				size_t local_processed = stats.total.reads_processed;
+				size_t local_input = stats.input_reads;
 
-				size_t global_classified;
-				size_t global_unique;
-				size_t global_matches;
-				size_t global_processed;
+				size_t global_classified = 0;
+				size_t global_matches = 0;
+				size_t global_unique = 0;
+				size_t global_processed = 0;
+				size_t global_input = 0;
 
-				//ahora toca reducir todos los totales de los stats y rep al global en el rank 0 
-				MPI_Reduce( &local_classified, &global_classified, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD );
-				MPI_Reduce( &local_unique, &global_unique, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD );
-				MPI_Reduce( &local_matches, &global_matches, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD );
-				MPI_Reduce( &local_processed, &global_processed, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD );
+				std::cerr << "[RANK " << rank << "] Empezando a esperar a hacer los reduce..." << std::endl;
 
-				//una vez hecho el reduce
+				//hacer los MPI reduce para sumar los resultados
+				MPI_Reduce(&local_classified, &global_classified, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+				MPI_Reduce(&local_matches, &global_matches, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+				MPI_Reduce(&local_unique, &global_unique, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+				MPI_Reduce(&local_processed, &global_processed, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+				MPI_Reduce(&local_input, &global_input, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+				//una vez tenemos el reduce 
 				if ( rank == 0 ){
 					stats.total.reads_classified = global_classified;
-					stats.total.reads_processed = global_processed;
-					//el total reads_classified y el reads_processed el mapa no lo sabe, el unique matches y total matches si, pongo a 0 los del rank 0
-					//stats.total.unique_matches = global_unique;
-					//stats.total.matches = global_matches;
+					stats.total.matches = 0; //ya estan en el mapa 
 					stats.total.unique_matches = 0;
-					stats.total.matches = 0;
-					//limpiar los contadores por jerarquia
-					for (auto& [etiqueta,j] : stats.hierarchy_total){
+					stats.total.reads_processed = global_processed;
+					stats.input_reads = global_input;
+					// limpiar los contadores por jerarquia 
+					for ( auto& [etiqueta, j] : stats.hierarchy_total){
 						j.matches = 0;
 						j.unique_matches = 0;
 					}
 				}
 
 
-				//unificar el mapa rep usando cereal para serializar y deserializar el mapa y enviarlo al rank 0. Podria intentar usar Mpi pack y unpack y un objetivo creado para el mapa pero el mapa es una coleccion de punteros distribuidos en memoria y por tanto no estan en memoria con un desplazamiento fijo y se vuelve todo muy complejo y complicado.
+				//unificar el mapa rep usando cereal para serializar y deserializar el mapa y enviarlo al rank 0. Podria intentar usar Mpi pack y unpack y un objetivo creado para el mapa pero el mapa es una coleccion de punteros distribuidos en memoria y por tanto no estan en memoria con un desplazamiento fijo y se vuelve todo muy complejo y complicado
+				std::cerr << "[RANK " << rank << "] Empezando a serializar el mapa con cereal..." << std::endl;
 
+				// seralizar y enviar los mapas a los ranks 
+				// para hacerlo mas rapido que secuencial lo voy a hacer estilo arbol binario, asi seran pasos logaritmicos y no lineales. 
+				int paso = 1; //indicar el paso en el que estamos 
 
-				if (rank != 0){
-					//si no soy el rank 0
-					std::stringstream ss;
-					{
-						cereal::BinaryOutputArchive oarchive( ss );
+				while ( paso < numeroProcesos ){
+					// recibe datos y los suma a los suyos 
+					if (rank % ( 2 * paso) == 0){
+						// si el rank es multiplo de 2*paso recibe los datos del rank rank+paso y los suma a los suyos 
+						int source = rank + paso;
+						if ( source < numeroProcesos ){
 
-						//como cereal no sabe trabajar con robin_hood map directamente, lo convierto temporalmente en un vector
-						//convierto el mapa a un vector con un par clave valor para que cereal lo entienda
-						std::vector<std::pair<std::string, detail::Rep>> temp_vec;
-						temp_vec.reserve(rep.size());
-						for (auto const& [clave, valor] : rep) {
-							temp_vec.push_back({clave,valor});
-						}
-
-						//oarchive( rep);
-						oarchive(temp_vec); //serializa el vector
-					}
-					std::string serialized_str = ss.str();
-					int len = serialized_str.size();
-					//envio el tamano del string serializado
-					MPI_Send( &len, 1, MPI_INT, 0, 0, MPI_COMM_WORLD );
-					//envio el string serializado
-					MPI_Send( serialized_str.c_str(), len, MPI_CHAR, 0, 0, MPI_COMM_WORLD );
-				}else{
-					//si soy el rank 0
-					for ( int i = 1; i < numeroProcesos; ++i ){
-						//recibo el tamano del string serializado
-						int len;
-						MPI_Recv( &len, 1, MPI_INT, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
-						//recibo el string serializado
-						std::vector<char> buffer(len);
-						MPI_Recv( buffer.data(), len, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE );
-						std::string serialized_str( buffer.data(), len );
-						//deserializo el string recibido y lo uno al rep global
-						std::stringstream ss_in( serialized_str );
-
-						//vector temporal para recibir los datos
-						std::vector<std::pair<std::string, detail::Rep>> temp_vec;
-
-						{
-							cereal::BinaryInputArchive iarchive(ss_in);
-							//deserializar el vector
-							iarchive(temp_vec);
-						}
-
-						//sumo temp_rep a rep (fusionar los dos mapas)
-						for (auto const& [target, r] : temp_vec){
-							if(target.empty()){
-								continue;
+							//recibir el tamano 
+							int len = 0;
+							MPI_Recv(&len, 1, MPI_INT, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+							//recibir el mapa serializado (los datos )
+							std::cerr << "[DEBUG RANK " << rank << "] - Recibiendo la cabecera (tamano) del rank " << source << " . Bytes a leer: " << len << std::endl;
+							std::vector<char> buffer(len);
+							MPI_Recv(buffer.data(), len, MPI_CHAR, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+							//deserializar el mapa recibido
+							std::string serialized_str(buffer.data(), len);
+							std::stringstream ss_in(serialized_str);
+							//std::vector<std::pair<std::string, detail::Rep> > temp_vec;
+							std::vector<std::string> keys;
+							std::vector<detail::Rep > values;
+							try{
+								cereal::BinaryInputArchive iarchive(ss_in);
+								//iarchive(temp_vec);
+								iarchive(keys);
+								iarchive(values);
+							}catch ( std::exception& e ){
+								std::cerr << "[ERROR RANK " << rank << " ]. Error al deserializar CERAL: " << e.what() << std::endl;
 							}
-							rep[target].matches += r.matches;
-							rep[target].lca_reads += r.lca_reads;
-							rep[target].unique_reads += r.unique_reads;
+
+							//std::cerr << "[DEBUG RANK " << rank << " ]. Desempaquetados " << temp_vec.size() << " pares del rank " << source << std::endl;
+
+							size_t cont_nuevos = 0;
+							size_t matches_recibidos_total = 0;
+
+							/*
+							// fusionar en el mapa local sumando contadores 
+							for ( auto const& [target, rep_received] : temp_vec ){
+							if ( rep.find(target) == rep.end() ) cont_nuevos++;
+							if ( target.empty() ) continue; //si esta vacio siguiente
+							detail::Rep& rep_local = rep[target];
+							rep_local.matches += rep_received.matches;
+							rep_local.lca_reads += rep_received.lca_reads;
+							rep_local.unique_reads += rep_received.unique_reads;
+							}*/
+
+							for ( size_t k = 0; k < keys.size(); ++k ){
+								auto& target = keys[k];
+								auto& r_recv = values[k];
+
+								matches_recibidos_total += r_recv.matches;
+								std::cerr << "[DEBUG RANK " << rank << "] Sumando al mapa local, matches recibidos: " << r_recv.matches << " , lca reads: " << r_recv.lca_reads << " , unique reads: " << r_recv.unique_reads << std::endl;
+								//sumar al mapa local 
+								rep[target].matches += r_recv.matches;
+								rep[target].lca_reads += r_recv.lca_reads;
+								rep[target].unique_reads += r_recv.unique_reads;
+
+							}
+
+							//std::cerr << "[DEBUG RANK " << rank << " ]. Fusion completada, anadidos " << cont_nuevos << " virus nuevos. Total actual es: " << rep.size() << std::endl;
+
+							std::cerr << "[DEBUG RANK " << rank << "] Recibidos " << keys.size() << " virus del Rank " << source << ". Suma de matches recibidos: " << matches_recibidos_total << std::endl;
 						}
+
+					}else{
+						// si el rank no es multiplo, es el que envia los datos 
+						int dest = rank - paso;
+
+						size_t num_elementos = 0;
+						size_t total_matches_enviados = 0;
+
+						//serializar 
+						std::stringstream ss;
+
+						try{
+							cereal::BinaryOutputArchive oarchive(ss);
+							//std::vector<std::pair<std::string, detail::Rep> > temp_vec;
+							std::vector<std::string> keys;
+							std::vector<detail::Rep> values;
+							keys.reserve(rep.size());
+							values.reserve(rep.size());
+							//temp_vec.reserve(rep.size());
+
+
+							for ( auto const& [key,val] : rep ) {
+								keys.push_back(key);
+								values.push_back(val);
+								total_matches_enviados += val.matches;
+
+							}
+
+							oarchive(keys);
+							oarchive(values);
+
+
+							/*
+							   for ( auto const& kv : rep ){
+							   temp_vec.emplace_back(kv.first, kv.second);
+							   }
+							   */
+
+							//num_elementos = temp_vec.size();
+							//oarchive(temp_vec);
+						}catch ( std::exception& e ){
+							std::cerr << "[ ERROR RANK " << rank << "]" << rank << " Fallo al serializar CEREAL: " << e.what() << std::endl;
+						}
+
+						std::string serialized_str = ss.str();
+						int len = static_cast<int>(serialized_str.size());
+
+						//std::cerr << "[ERROR RANK " << rank << "] -- > Enviando " << num_elementos << " elementos ( " << len << " bytes) al rank " << dest << std::endl;
+
+						std::cerr << "[DEBUG RANK " << rank << "] Enviando " << rep.size() << " virus al Rank " << dest << ". Suma de matches a enviar: " << total_matches_enviados << std::endl;
+
+						//enviar el tamano y los datos con un Isend y un Waitall (no bloqueantes) 
+						MPI_Request requests[2]; // array de request para el Isend, el primero pa el tamano y el segundo pa los datos 
+						MPI_Isend(&len, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &requests[0]);
+						MPI_Isend(serialized_str.c_str(), len, MPI_CHAR, dest, 0, MPI_COMM_WORLD, &requests[1]);
+						MPI_Waitall(2, requests, MPI_STATUSES_IGNORE);
+						// una vez enviado el mapa, salir del bucle 
+						break;
 					}
+					paso *= 2; //pasar al siguiente paso (multiplicar por 2)
 				}
 
-				//ahora rep en el rank 0 tiene el reporte global de todos los demas procesos, añadimos los totales globales 
-				//solo el rank 0 escribe el reporte final 
-				if( rank == 0){
-					stats.add_reports( hierarchy_label, rep ); //añadimos el reporte global a los stats globales
-										   // write reports, escribe el reporte final solo el rank 0 que ya tiene todos los reports de todos los demas procesos
+
+				if (rank == 0){
+					std::cerr << "[RANK " << rank << "] Rank 0 anadir al reporte y escribir el reporte ..." << std::endl;
+					stats.add_reports( hierarchy_label, rep );
+
+					// write reports
 					detail::write_report( rep, tax, out_rep, hierarchy_label );
 				}
 
-				//todos los procesos esperan a que se terminen de escribir sus hilos de escritura de archivos .lca y .all
+				std::cerr << "[RANK " << rank << "] Empezando a esperar a los hilos de escritura (tasks)..." << std::endl;
+
 				// Wait here until all files are written
 				for ( auto&& task : write_tasks )
 				{
 					task.get();
 				}
+
+				std::cerr << "[RANK " << rank << "] FIN de esperar a los workers (tasks)..." << std::endl;
 				timeClassPrint.stop();
 
-
-				// Close file for writing (if not STDOUT), cada rank cierra sus propios archivos de salida .lca y .all
+				std::cerr << "[RANK " << rank << "] Cerrar archivos escritura)..." << std::endl;
+				// Close file for writing (if not STDOUT)
 				if ( !config.output_prefix.empty() )
 				{
-					if ( config.output_lca  && out_lca.is_open() )
+					if ( config.output_lca && out_lca.is_open())
 						out_lca.close();
-					if ( config.output_all && out_all.is_open() )
+					if ( config.output_all && out_all.is_open())
 						out_all.close();
 				}
 
-				if(rank == 0){
-					//sincronizar todos los procesos antes de continuar a la siguiente jerarquia
-					if ( hierarchy_first )
-					{
-						//read_task.get();                    // get reading tasks at the end of the first hierarchy
-						pointer_helper->notify_push_over(); // notify push is over, only on first time (will be always set over for
-										    // next iterations)
-					}}
-			}//fin del bucle de jerarquias
+				std::cerr << "[RANK " << rank << "] Fin cerrar archivos de escritura..." << std::endl;
+
+				// ahora todos los procesos esperan 
+				if ( hierarchy_first )
+				{
+					read_task.get();                    // get reading tasks at the end of the first hierarchy
+					pointer_helper->notify_push_over(); // notify push is over, only on first time (will be always set over for
+									    // next iterations)
+				}
+
+			}
 
 			// Wait here until all unclassified reads are written
 			if ( config.output_unclassified )
@@ -1792,8 +2318,7 @@ namespace GanonClassify
 				write_unclassified_task.get();
 			}
 
-			//solo el rank 0 que imprima las estadisticas finales totales 
-			if( rank == 0){
+			if ( rank == 0 ) {
 				out_rep << "#total_classified\t" << stats.total.reads_classified << '\n';
 				// account for unclassified and skipped sequences
 				out_rep << "#total_unclassified\t" << stats.input_reads - stats.total.reads_classified << '\n';
@@ -1805,8 +2330,7 @@ namespace GanonClassify
 
 			timeGanon.stop();
 
-			//solo el rank 0 imprime las estadisticas 
-			if( rank == 0 ){
+			if ( rank == 0 ) {
 				if ( !config.quiet )
 				{
 					std::cerr << std::endl;
@@ -1817,7 +2341,6 @@ namespace GanonClassify
 					detail::print_stats( stats, timeClassPrint, parsed_hierarchy );
 				}
 			}
-
 			return true;
 		}
 
@@ -1833,9 +2356,9 @@ namespace GanonClassify
 			std::cerr << config;
 
 		if ( config.hibf )
-			return ganon_classify< detail::THIBF >( config , rank, numeroProcesos );
+			return ganon_classify< detail::THIBF >( config, rank, numeroProcesos );
 		else
-			return ganon_classify< detail::TIBF >( config, rank, numeroProcesos );
+			return ganon_classify< detail::TIBF >( config , rank, numeroProcesos);
 	}
 
 } // namespace GanonClassify
