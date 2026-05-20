@@ -298,212 +298,266 @@ namespace GanonClassify
 			return (char*) memchr( cursor, '\n', end - cursor ); //memchr busca el siguiente carater '\n' en el bloque de memoria entre cursor y end, me devuelve un puntero a ese caracter o nullptr si no lo encuentra
 		}
 
-
-
-		void parse_reads_parallel( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config, uint64_t start1, uint64_t end1, uint64_t start2, uint64_t end2, int rank, bool interleaved, bool two_files ){
-
+		void parse_reads_parallel( SafeQueue< ReadBatches >& queue1, Stats& stats, Config const& config, uint64_t start1, uint64_t end1, uint64_t start2, uint64_t end2, int rank, bool interleaved, bool two_files){
 			try{
-				long long lecturas_procesadas = 0;
-				size_t batch_size = config.n_reads; // numero de lecturas por batch 
-				//buffer aumentadno a 8MB pa no staturar mucho al so con llamadas constantes 
-				size_t BUFFER_SIZE = 8 * 1024 * 1024; // 8MB
-				if (two_files){
-					//dos archivos paired reads separados 
-					std::string filename1 = config.paired_reads[0]; //nombre del archivo 1 
-					std::string filename2 = config.paired_reads[1]; //nombre del archivo 2 
+				if (two_files) {
+					// si es paired reads es q hay dos archivos 
+					std::string filename1 = config.paired_reads[0];
+					std::string filename2 = config.paired_reads[1];
 
-
-					std::ifstream file1, file2; //streams de lectura para el archivo 1 y 2
-
-					std::vector< char> buffer1(BUFFER_SIZE), buffer2(BUFFER_SIZE); //buffers para leer los archivos, esto es para no saturar al sistema con llamadas constantes a disco, leemos bloques grandes de una vez y luego los procesamos en memoria ram 
-					file1.rdbuf()->pubsetbuf(buffer1.data(), BUFFER_SIZE); //asignamos el buffer al stream de lectura del archivo 1
-					file2.rdbuf()->pubsetbuf(buffer2.data(), BUFFER_SIZE); //asignamos el buffer al stream de lectura del archivo 2 
-					
-					file1.open(filename1, std::ios::binary); //abrimos el archivo 1 como binario 
-					file2.open(filename2, std::ios::binary); //abrimos el archivo 2 como binario  
-
-					if( !file1.is_open() || !file2.is_open() ){
-						std::cerr << "[RANK " << rank << "] Error opening files: " << filename1 << " or " << filename2 << std::endl; //mensaje de error si no de pude abirir alguno de los archivos 
+					int fd1 = open(filename1.c_str(), O_RDONLY);
+					int fd2 = open(filename2.c_str(), O_RDONLY);
+					if (fd1 == -1 || fd2 == -1) {
+						std::cerr << "[RANK " << rank << "] Error abriendo archivos Paired-End." << std::endl;
+						if (fd1 != -1) close(fd1); if (fd2 != -1) close(fd2);
 						return;
 					}
 
+					struct stat st1, st2; //sacar el tamano de los dos archivos 
+					fstat(fd1, &st1); fstat(fd2, &st2);
 
-					file1.seekg(start1); //movemos el puntero de lectura del archivo 1 a la posicion de inicio que nos toca 
+					long page_size = sysconf(_SC_PAGESIZE); //tamano de pagina del sistema 
+					size_t margin = 64 * 1024; //margen de seguridad para no quedar en medio de una lectura y no poder leer mas 
 
-					file2.seekg(start2); //movemos el puntero de lectura del archivo 2 a la posicion de inicio que nos toca
+					// Mapear Archivo 1
+					uint64_t map_offset1 = (start1 / page_size) * page_size;
+					uint64_t local_skip1 = start1 - map_offset1;
+					size_t map_length1 = (end1 - map_offset1) + margin;
+					if (map_offset1 + map_length1 > st1.st_size) map_length1 = st1.st_size - map_offset1;
+					char* map_ptr1 = static_cast<char*>(mmap(nullptr, map_length1, PROT_READ, MAP_PRIVATE, fd1, map_offset1));
 
-					// ahora toca sincronizar ambos archivos 
-					if ( start1 > 0 ){
-						std::string saltada; std::getline(file1, saltada); // saltar primera linea del archivvo que estara cortada 
-						while (file1.good() && file1.peek() != EOF){
-							if (is_valid_fastq_start(file1)){
-								//si es un bloque fastq valido, pues ya estamos sincronizados 
-								break;
-							}else{
-								//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
-								std::getline(file1, saltada); // seguir saltando lineas
+					// Mapear Archivo 2
+					uint64_t map_offset2 = (start2 / page_size) * page_size;
+					uint64_t local_skip2 = start2 - map_offset2;
+					size_t map_length2 = (end2 - map_offset2) + margin;
+					if (map_offset2 + map_length2 > st2.st_size) map_length2 = st2.st_size - map_offset2;
+					char* map_ptr2 = static_cast<char*>(mmap(nullptr, map_length2, PROT_READ, MAP_PRIVATE, fd2, map_offset2));
+
+					madvise(map_ptr1, map_length1, MADV_SEQUENTIAL | MADV_WILLNEED);
+					madvise(map_ptr2, map_length2, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+					char* cursor1 = map_ptr1 + local_skip1;
+					char* end_ptr1 = map_ptr1 + map_length1;
+					size_t logical_size1 = end1 - map_offset1;
+					char* logical_end1 = map_ptr1 + std::min(logical_size1, map_length1);
+
+					char* cursor2 = map_ptr2 + local_skip2;
+					char* end_ptr2 = map_ptr2 + map_length2;
+					size_t logical_size2 = end2 - map_offset2;
+					char* logical_end2 = map_ptr2 + std::min(logical_size2, map_length2);
+
+					// Sincronizar cursor 1
+					if (start1 > 0) {
+						char* nl = find_next_newline(cursor1, end_ptr1);
+						if (nl) cursor1 = nl + 1;
+						while (cursor1 < logical_end1) {
+							char* at = (char*)memchr(cursor1, '@', end_ptr1 - cursor1);
+							if (!at) break;
+							char* l1 = find_next_newline(at, end_ptr1);
+							if (l1) {
+								char* l2 = find_next_newline(l1 + 1, end_ptr1);
+								if (l2 && l2 + 1 < end_ptr1 && *(l2 + 1) == '+') { cursor1 = at; break; }
 							}
-
+							cursor1 = at + 1;
 						}
 					}
 
-					if ( start2 > 0 ){
-						std::string saltada; std::getline(file2, saltada); // saltar primera linea del archivvo que estara cortada 
-						while (file2.good() && file2.peek() != EOF){
-							if (is_valid_fastq_start(file2)){
-								//si es un bloque fastq valido, pues ya estamos sincronizados 
-								break;
-							}else{
-								//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
-								std::getline(file2, saltada); // seguir saltando lineas
+					// Sincronizar cursor 2
+					if (start2 > 0) {
+						char* nl = find_next_newline(cursor2, end_ptr2);
+						if (nl) cursor2 = nl + 1;
+						while (cursor2 < logical_end2) {
+							char* at = (char*)memchr(cursor2, '@', end_ptr2 - cursor2);
+							if (!at) break;
+							char* l1 = find_next_newline(at, end_ptr2);
+							if (l1) {
+								char* l2 = find_next_newline(l1 + 1, end_ptr2);
+								if (l2 && l2 + 1 < end_ptr2 && *(l2 + 1) == '+') { cursor2 = at; break; }
 							}
+							cursor2 = at + 1;
 						}
 					}
 
-					std::vector<std::string> ids; ids.reserve(batch_size); //vector para almacenar los IDs de las lecturas 
-					std::vector<std::vector<seqan3::dna4>> seqs; seqs.reserve(batch_size); //vector pa almacenar las secuencuas 
-					std::vector<std::vector<seqan3::dna4>> seqs2; seqs2.reserve(batch_size); //vector pa almacenar las secuecias de la pareja
+					size_t batch_size = config.n_reads;
+					ReadBatches rb{ true }; // true porque es paired
+					rb.ids.reserve(batch_size); rb.seqs.reserve(batch_size); rb.seqs2.reserve(batch_size);
 
-					std::string l1_id, l1_seq, l1_plus, l1_qual, l2_id, l2_seq, l2_plus, l2_qual; //variables para almacenar las lineas de cada bloque fastq de ambos archivos ( el id la secuencia el + y la calidad)
-					//reservar memoria para las lineas 
-					l1_id.reserve(300); l1_seq.reserve(600); l1_plus.reserve(100); l1_qual.reserve(600); //reservar 300 caraceres para el ID, 600 para la secuencia etc asi no tenemos que ir recolocando la mem constantemente y se mejora el rendimiento 
-					l2_id.reserve(300); l2_seq.reserve(600); l2_plus.reserve(100); l2_qual.reserve(600); //reservar memoria para las lineas del segundo archivo 
+					while (cursor1 < logical_end1 && cursor2 < logical_end2) {
+						if (cursor1 >= end_ptr1 || cursor2 >= end_ptr2) break;
 
-					while ( file1.good() && file2.good() ){
-						//good devuelve true si el stream esta en un estado bueno para seguir leyendo, es decir, no ha llegado al final del archivo ni ha ocurrido un Error
-						if (file1.tellg() != -1 && file1.tellg() >= end1 || file2.tellg() != -1 && file2.tellg() >= end2){
-							//si hemos llegado al final de nuestro bloque asignado en alguno de los archivos, pues salimos del bucle de lectura (como es paired si llegamos al final de 1 es q esta mal el otro asi q )
-							break;
+						// Extraer ID 1
+						char* id1_start = cursor1 + 1;
+						char* id1_end = find_next_newline(id1_start, end_ptr1);
+						if (!id1_end) break;
+						char* space1 = (char*)memchr(id1_start, ' ', id1_end - id1_start);
+						size_t id1_len = space1 ? space1 - id1_start : id1_end - id1_start;
+
+						// Extraer ID 2
+						char* id2_start = cursor2 + 1;
+						char* id2_end = find_next_newline(id2_start, end_ptr2);
+						if (!id2_end) break;
+						char* space2 = (char*)memchr(id2_start, ' ', id2_end - id2_start);
+						size_t id2_len = space2 ? space2 - id2_start : id2_end - id2_start;
+
+						rb.ids.emplace_back(id1_start, id1_len);
+
+						// Secuencia 1
+						char* seq1_start = id1_end + 1;
+						char* seq1_end = find_next_newline(seq1_start, end_ptr1);
+						std::string_view seq1_v(seq1_start, seq1_end - seq1_start);
+						auto dna1 = seq1_v | seqan3::views::char_to<seqan3::dna4>;
+						rb.seqs.emplace_back(dna1.begin(), dna1.end());
+
+						char* qual1 = find_next_newline(find_next_newline(seq1_end + 1, end_ptr1) + 1, end_ptr1);
+						cursor1 = qual1 + 1;
+
+						// Secuencia 2
+						char* seq2_start = id2_end + 1;
+						char* seq2_end = find_next_newline(seq2_start, end_ptr2);
+						std::string_view seq2_v(seq2_start, seq2_end - seq2_start);
+						auto dna2 = seq2_v | seqan3::views::char_to<seqan3::dna4>;
+						rb.seqs2.emplace_back(dna2.begin(), dna2.end());
+
+						char* qual2 = find_next_newline(find_next_newline(seq2_end + 1, end_ptr2) + 1, end_ptr2);
+						cursor2 = qual2 + 1;
+
+						if (rb.ids.size() >= batch_size) {
+							stats.input_reads += rb.ids.size();
+							queue1.push(std::move(rb));
+							rb = ReadBatches{ true };
+							rb.ids.reserve(batch_size); rb.seqs.reserve(batch_size); rb.seqs2.reserve(batch_size);
 						}
-						if (!std::getline(file1, l1_id) || !std::getline(file1, l1_seq) || !std::getline(file1, l1_plus) || !std::getline(file1, l1_qual)) break;
-						if (!std::getline(file2, l2_id) || !std::getline(file2, l2_seq) || !std::getline(file2, l2_plus) || !std::getline(file2, l2_qual)) break;
-
-						if (!l1_id.empty() && l1_id[0] == '@') l1_id.erase(0, 1); // eliminar el @ del ID 
-						if (!l2_id.empty() && l2_id[0] == '@') l2_id.erase(0, 1);
-
-						ids.push_back(std::move(l1_id)); //almacenar el id 
-
-						auto v1 = l1_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
-						seqs.emplace_back(v1.begin(), v1.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
-						auto v2 = l2_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
-						seqs2.emplace_back(v2.begin(), v2.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
-						l1_id.clear(); l1_seq.clear(); l1_plus.clear(); l1_qual.clear(); //limpiar las lineas para la siguiente lectura, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
-						l2_id.clear(); l2_seq.clear(); l2_plus.clear(); l2_qual.clear(); //limpiar las lineas del segundo archivo para la siguiente lectura 
-						lecturas_procesadas++;
-
-						if( ids.size() >= batch_size ){
-							//si hemos alcanzado el tamano de batch, enviamos el batch a la cola para que el hilo de procesamiento lo procese, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
-							stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
-							queue1.push( ReadBatches{ true, std::move(ids), std::move(seqs), std::move(seqs2) } ); //enviar el batch a la cola, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
-							ids.clear(); seqs.clear(); seqs2.clear(); //limpiar los vectores para el siguiente lote, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
-							ids.reserve(batch_size); seqs.reserve(batch_size); seqs2.reserve(batch_size);
-						}
-
 					}
 
+					if (!rb.ids.empty()) { stats.input_reads += rb.ids.size(); queue1.push(std::move(rb)); }
 
-					// enviar el ultimo batch con las lecturas restantes que quedaran aunque no alcanzara el tamano del batch
-					if (!ids.empty()) { stats.input_reads += ids.size(); queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2))); }
+					munmap(map_ptr1, map_length1); close(fd1);
+					munmap(map_ptr2, map_length2); close(fd2);
 					queue1.notify_push_over();
 
-				}else{
-					//single reads o interleaved 
-					std::string filename = config.single_reads.empty() ? config.paired_reads[0] : config.single_reads[0]; //nombre del archivo 
-					std::ifstream file;
-					std::vector<char> buffer(BUFFER_SIZE);
-					file.rdbuf()->pubsetbuf(buffer.data(), BUFFER_SIZE);
-																				
-					file.open(filename, std::ios::binary);
-					if (!file.is_open()) return;
+				} else {
+					if (config.single_reads.empty()) return;
+					std::string filename = config.single_reads[0];
 
-					file.seekg(start1); //movemos el puntero de lectura del archivo a la posicion de inicio que nos toca
+					int fd = open(filename.c_str(), O_RDONLY);
+					if (fd == -1) return;
 
-					if (start1 > 0){
-						std::string saltada; std::getline(file, saltada); // saltar primera linea del archivvo que estara cortada 
-						while (file.good() && file.peek() != EOF){
-							if (is_valid_fastq_start(file)){
-								//si es un bloque fastq valido, pues ya estamos sincronizados  pero dependera si es interleaved o no 
-								if (interleaved){
-									//si es interleaved, si caemos en el read 2 hay q avanzar hasta el primero
-									std::streampos pos = file.tellg(); //guarda la pos actual del puntero de lectura
-									std::string test_id; std::getline(file, test_id); //leer el id de la lectura 
-									if (test_id.find("/2") != std::string::npos || test_id.find(" 2:") != std::string::npos ){
-										std::getline(file, saltada); std::getline(file, saltada); std::getline(file, saltada); //avanzar hasta el primer read de la pareja 
-										continue; //std::string::npos es el valor que devuelve find cuanto no enuentra la subcadena
-									}else{
-										file.seekg(pos); //si no es una lectura 2 volvemos a la pos anterior 
+					struct stat st;
+					if (fstat(fd, &st) == -1) { close(fd); return; }
+
+					uint64_t file_size = st.st_size;
+					long page_size = sysconf(_SC_PAGESIZE);
+					uint64_t map_offset = (start1 / page_size) * page_size;
+					uint64_t local_skip = start1 - map_offset;
+					size_t margin = 64 * 1024;
+					size_t map_length = (end1 - map_offset) + margin;
+					if (map_offset + map_length > file_size) map_length = file_size - map_offset;
+
+					char* map_ptr = static_cast<char*>(mmap(nullptr, map_length, PROT_READ, MAP_PRIVATE, fd, map_offset));
+					if (map_ptr == MAP_FAILED) { close(fd); return; }
+
+					madvise(map_ptr, map_length, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+					char* cursor = map_ptr + local_skip;
+					char* end_ptr = map_ptr + map_length;
+					size_t logical_size = end1 - map_offset;
+					char* logical_end = map_ptr + std::min(logical_size, map_length);
+
+					if (start1 > 0) {
+						char* newline = find_next_newline(cursor, end_ptr);
+						if (newline) cursor = newline + 1;
+						bool valido = false;
+						while (cursor < logical_end) {
+							char* at_ptr = (char*)memchr(cursor, '@', end_ptr - cursor);
+							if (!at_ptr) break;
+							char* l1_end = find_next_newline(at_ptr, end_ptr);
+							if (l1_end) {
+								char* l2_end = find_next_newline(l1_end + 1, end_ptr);
+								if (l2_end && (l2_end + 1 < end_ptr) && *(l2_end + 1) == '+') {
+									if (interleaved) {
+										std::string_view id_view(at_ptr, l1_end - at_ptr);
+										bool is_first = (id_view.find("/1") != std::string_view::npos || id_view.find(" 1:") != std::string_view::npos || id_view.find(" 1/") != std::string_view::npos);
+										if (!is_first && (id_view.find("/2") != std::string_view::npos || id_view.find(" 2:") != std::string_view::npos || id_view.find(" 2/") != std::string_view::npos)) {
+											cursor = l2_end + 1; continue;
+										}
 									}
+									cursor = at_ptr; valido = true; break;
 								}
-								break;
 							}
-							//si no es un bloque fastq valido, pues seguimos saltando lineas hasta encontrar uno valido o llegar al final del archivo 
-							std::getline(file, saltada); // seguir saltando lineas
+							cursor = at_ptr + 1;
 						}
-					}
-					
-					std::vector<std::string> ids; ids.reserve(batch_size);
-					std::vector<std::vector<seqan3::dna4>> seqs; seqs.reserve(batch_size);
-					std::vector<std::vector<seqan3::dna4>> seqs2;
-					if (interleaved) seqs2.reserve(batch_size);
-					std::string l_id, l_seq, l_plus, l_qual;
-
-					l_id.reserve(300); l_seq.reserve(600); l_plus.reserve(100); l_qual.reserve(600);
-					
-					while (file.good()){
-						if (file.tellg() != -1 && file.tellg() >= end1){
-							//si hemos llegado al final de nuestro bloque asignado, pues salimos del bucle de lectura 
-							break;
-						}
-						if (!std::getline(file, l_id) || !std::getline(file, l_seq) || !std::getline(file, l_plus) || !std::getline(file, l_qual)) break;
-
-						if (!l_id.empty() && l_id[0] == '@') l_id.erase(0, 1); // eliminar el @ del ID 
-
-						ids.push_back(std::move(l_id)); //almacenar el id 
-
-						auto v = l_seq | seqan3::views::char_to<seqan3::dna4>; //convertir la secuencia a dna4 usando char_to, esto evita copias innecesarias y mejora el rendimiento
-						seqs.emplace_back(v.begin(), v.end()); //almacenar la secuencia convertida a dna4, esto evita copias innecesarias y mejora el rendimiento
-
-						if (interleaved){
-							if (!std::getline(file, l_id) || !std::getline(file, l_seq) || !std::getline(file, l_plus) || !std::getline(file, l_qual)) break;
-							auto v2 = l_seq | seqan3::views::char_to<seqan3::dna4>;
-							seqs2.emplace_back(v2.begin(), v2.end());
-						}
-
-						l_id.clear(); l_seq.clear(); l_plus.clear(); l_qual.clear(); //limpiar las lineas para la siguiente lectura, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
-						lecturas_procesadas++;
-
-						if( ids.size() >= batch_size ){
-							//si hemos alcanzado el tamano de batch, enviamos el batch a la cola para que el hilo de procesamiento lo procese, moviendo los vectores para evitar copias innecesarias y mejorar el rendimiento
-							stats.input_reads += ids.size(); //actualizamos el contador de lecturas procesadas con el lote actualizamos
-						
-							if (interleaved) queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2)));
-							else queue1.push(ReadBatches(false, std::move(ids), std::move(seqs)));
-
-							ids.clear(); seqs.clear(); ids.reserve(batch_size); seqs.reserve(batch_size); if (interleaved) seqs2.clear(); seqs2.reserve(batch_size); //limpiar los vectores para el siguiente lote, esto es importante para no tener que ir recolocando la memoria constantemente y mejorar el rendimiento
-						}
+						if (!valido) { munmap(map_ptr, map_length); close(fd); queue1.notify_push_over(); return; }
 					}
 
-					// enviar el ultimo batch con las lecturas restantes que quedaran aunque no alcanzara el tamano del batch_size 
-					if (!ids.empty()) { 
-						stats.input_reads += ids.size(); 
-						if (interleaved) queue1.push(ReadBatches(true, std::move(ids), std::move(seqs), std::move(seqs2)));
-						else queue1.push(ReadBatches(false, std::move(ids), std::move(seqs)));
+					size_t batch_size = config.n_reads;
+					ReadBatches rb{ interleaved };
+					rb.ids.reserve(batch_size); rb.seqs.reserve(batch_size);
+					if (interleaved) rb.seqs2.reserve(batch_size);
+
+					while (cursor < logical_end) {
+						if (cursor >= end_ptr) break;
+						char* id_start = cursor + 1;
+						char* id_end = find_next_newline(id_start, end_ptr);
+						if (!id_end) break;
+
+						char* space_pos = (char*)memchr(id_start, ' ', id_end - id_start);
+						size_t id_len = (space_pos) ? (space_pos - id_start) : (id_end - id_start);
+						rb.ids.emplace_back(id_start, id_len);
+
+						char* seq_start = id_end + 1;
+						char* seq_end = find_next_newline(seq_start, end_ptr);
+						if (!seq_end) break;
+						std::string_view seq_view(seq_start, seq_end - seq_start);
+						auto dna_view = seq_view | seqan3::views::char_to<seqan3::dna4>;
+						rb.seqs.emplace_back(dna_view.begin(), dna_view.end());
+
+						char* plus_line_end = find_next_newline(seq_end + 1, end_ptr);
+						if (!plus_line_end) break;
+						char* qual_line_end = find_next_newline(plus_line_end + 1, end_ptr);
+						if (!qual_line_end) break;
+						cursor = qual_line_end + 1;
+
+						if (interleaved) {
+							if (cursor >= end_ptr) break;
+							char* id2_end = find_next_newline(cursor, end_ptr);
+							if (!id2_end) break;
+							char* seq2_start = id2_end + 1;
+							char* seq2_end = find_next_newline(seq2_start, end_ptr);
+							if (!seq2_end) break;
+
+							std::string_view seq2_view(seq2_start, seq2_end - seq2_start);
+							auto dna2_view = seq2_view | seqan3::views::char_to<seqan3::dna4>;
+							rb.seqs2.emplace_back(dna2_view.begin(), dna2_view.end());
+
+							char* plus2_line_end = find_next_newline(seq2_end + 1, end_ptr);
+							if (!plus2_line_end) break;
+							char* qual2_line_end = find_next_newline(plus2_line_end + 1, end_ptr);
+							if (!qual2_line_end) break;
+							cursor = qual2_line_end + 1;
+						}
+
+						if (rb.ids.size() >= batch_size) {
+							stats.input_reads += rb.ids.size();
+							queue1.push(std::move(rb));
+							rb = ReadBatches{ interleaved };
+							rb.ids.reserve(batch_size); rb.seqs.reserve(batch_size);
+							if (interleaved) rb.seqs2.reserve(batch_size);
+						}
 					}
+					if (!rb.ids.empty()) { stats.input_reads += rb.ids.size(); queue1.push(std::move(rb)); }
+
 					queue1.notify_push_over();
-
+					munmap(map_ptr, map_length); close(fd);
 				}
 
-			} catch( const std::exception& e ){
+			} catch (const std::exception& e){
 				std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: " << e.what() << "\n" << std::endl;
-				queue1.notify_push_over(); // Evitar deadlock
+				queue1.notify_push_over();
 			} catch(...){
-				std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: Excepcion desconocida.\n" << std::endl;
-				queue1.notify_push_over(); // Evitar deadlock
+				std::cerr << "\n[RANK " << rank << " FATAL ERROR EN HILO]: Excepción desconocida.\n" << std::endl;
+				queue1.notify_push_over();
 			}
-
-
 		}
-
 
 
 		/*
