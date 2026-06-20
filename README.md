@@ -73,7 +73,7 @@ mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-std=c++23 -Wno-interference-size" ..
 make -j 4
 ```
-Finally, install de parallel GanonMPI version:
+Finally, install the parallel GanonMPI version:
 ```bash
 git clone https://github.com/svcamba/GanonMPI.git
 cd GanonMPI
