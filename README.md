@@ -67,7 +67,7 @@ make install
 Upon completion, the executable binaries will be generated inside the `build/` directory.
 Next, install **Raptor**:
 ```bash
-git clone --branch raptor-v3.0.1 --recurse-submodules [https://github.com/seqan/raptor](https://github.com/seqan/raptor)
+git clone --branch raptor-v3.0.1 --recurse-submodules https://github.com/seqan/raptor
 cd raptor
 mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-std=c++23 -Wno-interference-size" ..
@@ -75,7 +75,7 @@ make -j 4
 ```
 Finally, install de parallel GanonMPI version:
 ```bash
-git clone [https://github.com/svcamba/GanonMPI.git](https://github.com/svcamba/GanonMPI.git)
+git clone https://github.com/svcamba/GanonMPI.git
 cd GanonMPI
 # Warning: Replace 'branch_name' with the specific branch you want to use
 git checkout branch_name 
