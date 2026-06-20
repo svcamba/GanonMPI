@@ -64,7 +64,7 @@ cmake -DCMAKE_BUILD_TYPE=Release -DVERBOSE_CONFIG=ON -DCMAKE_EXPORT_COMPILE_COMM
 make -j 4
 make install
 ```
-Upon completion, the executable binaries will be generated inside the *build/* directory.
+Upon completion, the executable binaries will be generated inside the `build/` directory.
 Next, install **Raptor**:
 ```bash
 git clone --branch raptor-v3.0.1 --recurse-submodules [https://github.com/seqan/raptor](https://github.com/seqan/raptor)
@@ -97,7 +97,7 @@ gunzip SRR29606654_2.fastq.gz
 ```
 
 ## Execution on the Pluton Cluster (Slurm)
-Create a *bash* script (e.g., job.sh) with the following content:
+Create a `bash` script (e.g., `job.sh`) with the following content:
 ```bash
 #!/bin/bash
 #SBATCH --job-name=GanonMPI # Job name displayed in the Slurm queue
