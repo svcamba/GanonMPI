@@ -90,7 +90,7 @@ ganon build --source refseq --organism-group archaea bacteria fungi viral --thre
 ```
 
 ## Sequence Download Example
-For instance, to download the *SRR29606654* sequence from the *ENA* website (*https://www.ebi.ac.uk/), retrieve the files and decompress them using:
+For instance, to download the *SRR29606654* sequence from the *ENA* website (https://www.ebi.ac.uk/), retrieve the files and decompress them using:
 ```bash
 gunzip SRR29606654_1.fastq.gz
 gunzip SRR29606654_2.fastq.gz
