@@ -55,7 +55,7 @@ module load cmake/3.25.2
 ```
 Clone and compile the original tool:
 ```bash
-git clone --recurse-submodules [https://github.com/pirovc/ganon.git](https://github.com/pirovc/ganon.git)
+git clone --recurse-submodules https://github.com/pirovc/ganon.git
 cd ganon
 pip install .
 mkdir -p build
