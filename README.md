@@ -44,15 +44,9 @@ To compile and execute **GanonMPI** on an **HPC cluster**, the following compone
 * **Python 3**.
 * **OpenSSL** (required to download the indexes).
 
-### Basic Installation Example
+---
 
-First, if you are using a system with **Lmod** environments, load the required modules using the following commands:
-```bash
-module load gnu12
-module load openssl/1.1.1w
-module load python/3.12.9
-module load cmake/3.25.2
-```
+### Basic Installation Example
 Clone and compile the original tool:
 ```bash
 git clone --recurse-submodules https://github.com/pirovc/ganon.git
@@ -94,44 +88,4 @@ For instance, to download the *SRR29606654* sequence from the *ENA* website (htt
 ```bash
 gunzip SRR29606654_1.fastq.gz
 gunzip SRR29606654_2.fastq.gz
-```
-
-## Execution on the Pluton Cluster (Slurm)
-Create a `bash` script (e.g., `job.sh`) with the following content:
-```bash
-#!/bin/bash
-#SBATCH --job-name=GanonMPI # Job name displayed in the Slurm queue
-#SBATCH --output=SRR37421749_PairedReads_BD_GRANDE_%a.out
-#SBATCH -N 8 # Number of nodes
-#SBATCH -n 32 # Total number of MPI processes (across all nodes)
-#SBATCH -t 70:20:00 # Estimated execution time; Slurm will kill the job if exceeded
-#SBATCH --mem=0 # Request all available RAM on the assigned nodes
-
-# MPI environment variables and local installation paths
-export MPI_HOME=$HOME/software/openmpi-5.0.3-gnu12
-export PATH=$MPI_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$MPI_HOME/lib:$LD_LIBRARY_PATH
-export MANPATH=$MPI_HOME/share/man:$MANPATH
-export PKG_CONFIG_PATH=$MPI_HOME/lib/pkgconfig:$PKG_CONFIG_PATH
-
-echo "--- START MPI BENCHMARK ---"
-echo "Nodes: 8"
-echo "Threads per MPI process: 7; Total MPI processes: 32"
-
-# Execution
-# Using /usr/bin/time -v to benchmark memory and real time
-/usr/bin/time -v $MPI_HOME/bin/mpirun -x LD_LIBRARY_PATH ../build/ganon-classify \
-    --paired-reads \
-    ../../secuencias/SRR37421749/SRR37421749_1.fastq,\
-    ../../secuencias/SRR37421749/SRR37421749_2.fastq \
-    --ibf ../ganon/abfv_rs_cg.hibf \
-    --tax ../ganon/abfv_rs_cg.tax \
-    --rel-cutoff 0.75 --rel-filter 0.1 --fpr-query 1e-05 \
-    --skip-lca --output-all --hibf \
-    --output-prefix SRR37421749_BD_GRANDE \
-    --threads 7
-```
-Finally, submit the job to the cluster's queue system:
-```bash
-sbatch job.sh
 ```
